@@ -32,6 +32,23 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+/*
+ * Copyright (C) 2016 Sinodun IT Ltd.
+ *
+ * Permission to use, copy, modify, and distribute this software and its
+ * documentation for any purpose with or without fee is hereby granted,
+ * provided that the above copyright notice and this permission notice
+ * appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+ * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -120,7 +137,7 @@ perf_net_parselocal(int family, const char *name, unsigned int port,
 
 int
 perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
-		    unsigned int offset, int bufsize)
+		    unsigned int offset, int bufsize, int sock_type)
 {
 	int family;
 	int sock;
@@ -128,6 +145,8 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 	int port;
 	int ret;
 	int flags;
+	socklen_t len = sizeof(int);
+	int sndbuf, rcvbuf;
 
 	family = isc_sockaddr_pf(server);
 
@@ -135,7 +154,7 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 		perf_log_fatal("server and local addresses have "
 			       "different families");
 
-	sock = socket(family, SOCK_DGRAM, 0);
+	sock = socket(family, sock_type, 0);
 	if (sock == -1)
 		perf_log_fatal("Error: socket: %s\n", strerror(errno));
 
@@ -150,9 +169,19 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 	}
 #endif
 
+	flags = fcntl(sock, F_GETFL, 0);
+	if (flags < 0)
+		perf_log_fatal("fcntl(F_GETFL)");
+	ret = fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+	if (ret < 0)
+		perf_log_fatal("fcntl(F_SETFL)");
+
 	tmp = *local;
 	port = isc_sockaddr_getport(&tmp);
-	if (port != 0 && offset != 0) {
+	if (offset == UINT_MAX) {
+		/* Override any port that has been set.*/
+		isc_sockaddr_setport(&tmp, 0);
+	} else if (port != 0 && offset != 0) {
 		port += offset;
 		if (port >= 0xFFFF)
 			perf_log_fatal("port %d out of range", port);
@@ -161,7 +190,14 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 
 	if (bind(sock, &tmp.type.sa, tmp.length) == -1)
 		perf_log_fatal("bind: %s\n", strerror(errno));
-
+	if (sock_type == SOCK_STREAM &&
+		connect(sock, &server->type.sa, server->length) < 0) {
+		if (!(errno == EINPROGRESS || errno == EWOULDBLOCK)) {
+			perf_log_warning("Error connecting to socket: %s.\n", strerror(errno));
+			return -1;
+		}
+	}
+	
 	if (bufsize > 0) {
 		bufsize *= 1024;
 
@@ -175,13 +211,7 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 		if (ret < 0)
 			perf_log_warning("setsockbuf(SO_SNDBUF) failed");
 	}
-
-	flags = fcntl(sock, F_GETFL, 0);
-	if (flags < 0)
-		perf_log_fatal("fcntl(F_GETFL)");
-	ret = fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-	if (ret < 0)
-		perf_log_fatal("fcntl(F_SETFL)");
+	
 
 	return sock;
 }

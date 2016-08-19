@@ -15,6 +15,23 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+/*
+ * Copyright (C) 2016 Sinodun IT Ltd.
+ *
+ * Permission to use, copy, modify, and distribute this software and its
+ * documentation for any purpose with or without fee is hereby granted,
+ * provided that the above copyright notice and this permission notice
+ * appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+ * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
 #include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -57,6 +74,34 @@ perf_os_handlesignal(int sig, void (*handler)(int))
 }
 
 isc_result_t
+perf_os_waituntilwriteable(int fd, isc_int64_t timeout)
+{
+	fd_set write_fds;
+	struct timeval tv, *tvp;
+	int n;
+
+	FD_ZERO(&write_fds);
+	FD_SET(fd, &write_fds);
+	if (timeout < 0) {
+		tvp = NULL;
+	} else {
+		tv.tv_sec = timeout / MILLION;
+		tv.tv_usec = timeout % MILLION;
+		tvp = &tv;
+	}
+	n = select(fd + 1, NULL, &write_fds, NULL, tvp);
+	if (n < 0) {
+		if (errno != EINTR)
+			perf_log_fatal("select() failed: Error was %s", strerror(errno));
+		return (ISC_R_CANCELED);
+	} else if (FD_ISSET(fd, &write_fds)) {
+		return (ISC_R_SUCCESS);
+	} else {
+		return (ISC_R_TIMEDOUT);
+	}
+}
+
+isc_result_t
 perf_os_waituntilreadable(int fd, int pipe_fd, isc_int64_t timeout)
 {
 	fd_set read_fds;
@@ -78,7 +123,7 @@ perf_os_waituntilreadable(int fd, int pipe_fd, isc_int64_t timeout)
 	n = select(maxfd + 1, &read_fds, NULL, NULL, tvp);
 	if (n < 0) {
 		if (errno != EINTR)
-			perf_log_fatal("select() failed");
+			perf_log_fatal("select() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
 	} else if (FD_ISSET(fd, &read_fds)) {
 		return (ISC_R_SUCCESS);
@@ -102,6 +147,8 @@ perf_os_waituntilanyreadable(int *fds, unsigned int nfds, int pipe_fd,
 	FD_ZERO(&read_fds);
 	maxfd = 0;
 	for (i = 0; i < nfds; i++) {
+		if (fds[i] == -1)
+			continue;
 		FD_SET(fds[i], &read_fds);
 		if (fds[i] > maxfd)
 			maxfd = fds[i];
@@ -120,7 +167,7 @@ perf_os_waituntilanyreadable(int *fds, unsigned int nfds, int pipe_fd,
 	n = select(maxfd + 1, &read_fds, NULL, NULL, tvp);
 	if (n < 0) {
 		if (errno != EINTR)
-			perf_log_fatal("select() failed");
+			perf_log_fatal("select() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
 	} else if (n == 0) {
 		return (ISC_R_TIMEDOUT);
