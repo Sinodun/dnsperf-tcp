@@ -605,7 +605,8 @@ wait_for_start(void)
 static isc_boolean_t
 find_working_tcp_connection(int *socknum, threadinfo_t *tinfo) 
 {
-	for (int i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
+	int i;
+	for (i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
 		if (*socknum == tinfo->nsocks)
 			(*socknum) = 0;
 		if (tinfo->socks[*socknum] == -1 ||
@@ -628,7 +629,7 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			continue;
 		} else if (error != 0) {
 			/* TODO: Need to reset the connection again */
-			perf_log_warning("Error: cannot use connection %i, fd %: %s", 
+			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
 			               *socknum, tinfo->socks[*socknum], strerror(error));
 			continue;
 		}
