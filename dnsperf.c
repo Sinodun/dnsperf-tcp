@@ -81,6 +81,9 @@
 #include <isc/sockaddr.h>
 #include <isc/types.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include <dns/rcode.h>
 #include <dns/result.h>
 
@@ -128,6 +131,7 @@ typedef struct {
 	isc_boolean_t updates;
 	isc_boolean_t verbose;
 	isc_boolean_t usetcp;
+	isc_boolean_t usetcptls;
 	isc_uint32_t max_tcp_q;
 } config_t;
 
@@ -162,7 +166,8 @@ typedef enum {
 	SOCKET_TCP_HANDSHAKE,
 	SOCKET_TCP_SENT_MAX,
 	SOCKET_SENDING,
-	SOCKET_READING
+	SOCKET_READING,
+	SOCKET_TLS_HANDSHAKE
 } socket_state_t;
 
 typedef struct 
@@ -174,6 +179,8 @@ typedef struct
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
 	unsigned int tcp_to_read;
+	SSL *ssl_read;
+	SSL *ssl_write;
 } sockinfo_t;
 
 typedef ISC_LIST(struct query_info) query_list;
@@ -237,6 +244,8 @@ static int intrpipe[2];
 static isc_mem_t *mctx;
 
 static perf_datafile_t *input;
+
+static SSL_CTX *ctx;
 
 static void
 handle_sigint(int sig)
@@ -516,6 +525,9 @@ setup(int argc, char **argv, config_t *config)
 	perf_opt_add('z', perf_opt_boolean, NULL,
 		     "use TCP",
 		     NULL, &config->usetcp);
+	perf_opt_add('L', perf_opt_boolean, NULL,
+		     "use TCP/TLS",
+		     NULL, &config->usetcptls);
  	perf_opt_add('Z', perf_opt_uint, "num_queries on tcp connection",
  		     "max no. of queries to be sent on a single TCP connection",
  		     stringify(0),
@@ -537,6 +549,9 @@ setup(int argc, char **argv, config_t *config)
 
 	if (config->dnssec)
 		config->edns = ISC_TRUE;
+
+	if (config->usetcptls)
+		config->usetcp = ISC_TRUE;
 
 	if (tsigkey != NULL)
 		config->tsigkey = perf_dns_parsetsigkey(tsigkey, mctx);
@@ -668,13 +683,30 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			                                  != ISC_R_SUCCESS)
 				continue;
 			LOCK(&tinfo->lock);
-			sock->state = SOCKET_FREE;
+			sock->state = (tinfo->config->usetcptls == ISC_TRUE) ? SOCKET_TLS_HANDSHAKE : SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
 		} else if (error != 0) {
 			/* TODO: Need to reset the connection again */
 			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
 			               *socknum, sock->fd, strerror(error));
 			continue;
+		}
+		if (sock->state == SOCKET_TLS_HANDSHAKE) {
+			switch(SSL_connect(sock->ssl_write)) {
+			case 0:
+				perf_log_fatal("SSL connect: %s",
+					       ERR_reason_error_string(ERR_get_error()));
+				break;
+
+			case 1:
+				LOCK(&tinfo->lock);
+				sock->state = SOCKET_FREE;
+				UNLOCK(&tinfo->lock);
+				break;
+
+			default:
+				continue;
+			}
 		}
 		return ISC_TRUE;
 	}
@@ -1005,6 +1037,23 @@ bit_check(unsigned char *bits, unsigned int bit)
 	return ISC_FALSE;
 }
 
+static void
+setup_ssl(threadinfo_t *tinfo, sockinfo_t *s)
+{
+	if (tinfo->config->usetcptls == ISC_TRUE) {
+		s->ssl_read = SSL_new(ctx);
+		if (s->ssl_read == NULL)
+			perf_log_fatal("creating SSL read object: %s",
+				       ERR_reason_error_string(ERR_get_error()));
+		SSL_set_fd(s->ssl_read, s->fd);
+		s->ssl_write = SSL_new(ctx);
+		if (s->ssl_write == NULL)
+			perf_log_fatal("creating SSL write object: %s",
+				       ERR_reason_error_string(ERR_get_error()));
+		SSL_set_fd(s->ssl_write, s->fd);
+	}
+}
+
 static isc_boolean_t
 check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 {
@@ -1022,6 +1071,14 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		sock->num_sent = 0;
 		sock->num_recv = 0;
 		sock->state = SOCKET_CLOSED;
+		if (sock->ssl_read != NULL) {
+			SSL_free(sock->ssl_read);
+			sock->ssl_read = NULL;
+		}
+		if (sock->ssl_write != NULL) {
+			SSL_free(sock->ssl_write);
+			sock->ssl_write = NULL;
+		}
 		UNLOCK(&tinfo->lock);
 		/* We can't easily re-open the same port because we have
 		the TIME_WAIT state, so for now disregard the -x option here*/
@@ -1035,6 +1092,7 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		LOCK(&tinfo->lock);
 		sock->fd = fd;
 		sock->state = SOCKET_TCP_HANDSHAKE;
+		setup_ssl(tinfo, sock);
 		UNLOCK(&tinfo->lock);
 	}
 	return ISC_TRUE;
@@ -1323,6 +1381,7 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 			tinfo->socks[i].num_recv = 0;
 			isc_buffer_init(&tinfo->socks[i].sending, tinfo->socks[i].sending_buffer, MAX_EDNS_PACKET);
 			tinfo->socks[i].state = SOCKET_CLOSED;
+			setup_ssl(tinfo, &tinfo->socks[i]);
 		}
 		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
 							 &config->local_addr,
@@ -1369,9 +1428,19 @@ main(int argc, char **argv)
 	threadinfo_t stats_thread;
 	unsigned int i;
 	isc_result_t result;
+	const SSL_METHOD *method;
 
 	printf("DNS Performance Testing Tool\n"
 	       "Nominum Version " VERSION "\n\n");
+
+	SSL_library_init();
+	OpenSSL_add_all_algorithms();
+	SSL_load_error_strings();
+	method = TLS_client_method();
+	ctx = SSL_CTX_new(method);
+	if (ctx == NULL)
+		perf_log_fatal("creating SSL context: %s",
+			       ERR_reason_error_string(ERR_get_error()));
 
 	setup(argc, argv, &config);
 
