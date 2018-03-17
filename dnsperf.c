@@ -91,7 +91,7 @@
 #include "opt.h"
 #include "os.h"
 #include "util.h"
-#include "version.h"
+#include "config.h"
 
 #define DEFAULT_SERVER_NAME		"127.0.0.1"
 #define DEFAULT_SERVER_PORT		53

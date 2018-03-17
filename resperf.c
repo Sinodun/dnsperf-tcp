@@ -81,7 +81,7 @@
 #include "net.h"
 #include "opt.h"
 #include "util.h"
-#include "version.h"
+#include "config.h"
 
 /*
  * Global stuff
