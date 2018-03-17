@@ -57,6 +57,7 @@
 			       strerror(__n));				\
 	} while (0)
 
+#undef LOCK
 #define LOCK(mutex) do {						\
 	int __n = pthread_mutex_lock((mutex));				\
 	if (__n != 0)							\
@@ -64,6 +65,7 @@
 			       strerror(__n));				\
 	} while (0)
 
+#undef UNLOCK
 #define UNLOCK(mutex) do {						\
 	int __n = pthread_mutex_unlock((mutex));			\
 	if (__n != 0)							\
@@ -78,6 +80,7 @@
 			       strerror(__n));				\
 	} while (0)
 
+#undef SIGNAL
 #define SIGNAL(cond) do {						\
 	int __n = pthread_cond_signal((cond));				\
 	if (__n != 0)							\
@@ -85,6 +88,7 @@
 			       strerror(__n));				\
 	} while (0)
 
+#undef BROADCAST
 #define BROADCAST(cond) do {						\
 	int __n = pthread_cond_broadcast((cond));			\
 	if (__n != 0)							\
@@ -92,6 +96,7 @@
 			       strerror(__n));				\
 	} while (0)
 
+#undef WAIT
 #define WAIT(cond, mutex) do {						\
 	int __n = pthread_cond_wait((cond), (mutex));			\
 	if (__n != 0)							\

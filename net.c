@@ -145,8 +145,6 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 	int port;
 	int ret;
 	int flags;
-	socklen_t len = sizeof(int);
-	int sndbuf, rcvbuf;
 
 	family = isc_sockaddr_pf(server);
 

@@ -658,7 +658,6 @@ do_send(void *arg)
 	unsigned int length;
 	int n;
 	isc_result_t result;
-	unsigned char pkt_tcp_payload[2];
 	int socknum;
 	
 	tinfo = (threadinfo_t *) arg;
