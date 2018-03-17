@@ -26,6 +26,7 @@ AC_SUBST(DNSLIBS, "`$ac_cv_isc_config --libs dns bind9`")
 AC_SUBST(DNSCFLAGS, "`$ac_cv_isc_config --cflags dns bind9`")
 
 AX_PTHREAD
+AX_CHECK_OPENSSL([], [AC_MSG_ERROR(["OpenSSL libraries not found"])])
 
 AC_CONFIG_FILES(Makefile)
 

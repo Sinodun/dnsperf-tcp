@@ -5,10 +5,10 @@ bin_PROGRAMS = dnsperf resperf
 noinst_LIBRARIES = libperf.a
 libperf_a_SOURCES = datafile.c dns.c log.c net.c opt.c os.c
 
-AM_CFLAGS = @DNSCFLAGS@ @PTHREAD_CFLAGS@
+AM_CFLAGS = @DNSCFLAGS@ @PTHREAD_CFLAGS@ @OPENSSL_INCLUDES@
 
 dnsperf_SOURCES = dnsperf.c
-dnsperf_LDADD = libperf.a @DNSLIBS@ @PTHREAD_LIBS@
+dnsperf_LDADD = libperf.a @OPENSSL_LDFLAGS@ @OPENSSL_LIBS@ @DNSLIBS@ @PTHREAD_LIBS@
 
 resperf_SOURCES = resperf.c
 resperf_LDADD = libperf.a @DNSLIBS@ @PTHREAD_LIBS@
