@@ -33,16 +33,16 @@
  */
 
 /*
- * Copyright (C) 2016 Sinodun IT Ltd.
+ * Copyright (C) 2016,2018 Sinodun IT Ltd.
  *
  * Permission to use, copy, modify, and distribute this software and its
  * documentation for any purpose with or without fee is hereby granted,
  * provided that the above copyright notice and this permission notice
  * appear in all copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+ * THE SOFTWARE IS PROVIDED "AS IS" AND SINODUN DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL SINODUN BE LIABLE FOR
  * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
@@ -156,13 +156,28 @@ typedef struct {
 	isc_uint64_t latency_max;
 } stats_t;
 
+typedef enum {
+	SOCKET_FREE,
+	SOCKET_CLOSED,
+	SOCKET_TCP_HANDSHAKE,
+	SOCKET_TCP_SENT_MAX
+} socket_state_t;
+
+typedef struct 
+{
+	int fd;
+	isc_uint64_t num_recv;
+	isc_uint64_t num_sent;
+	socket_state_t state;
+} sockinfo_t;
+
 typedef ISC_LIST(struct query_info) query_list;
 
 typedef struct query_info {
 	isc_uint64_t timestamp;
 	query_list *list;
 	char *desc;
-	int sock;
+	sockinfo_t *sock;
 	/*
 	 * This link links the query into the list of outstanding
 	 * queries or the list of available query IDs.
@@ -171,13 +186,6 @@ typedef struct query_info {
 } query_info;
 
 #define NQIDS 65536
-
-typedef enum {
-	TCP_CLOSED,
-	TCP_IN_HANDSHAKE,
-	TCP_OK,
-	TCP_SENT_MAX
-} tcp_conn_state_t;
 
 typedef struct {
 	query_info queries[NQIDS];
@@ -192,10 +200,7 @@ typedef struct {
 
 	unsigned int nsocks;
 	int current_sock;
-	int *socks;
-	isc_uint64_t *sock_num_recv;
-	isc_uint64_t *sock_num_sent;
-	tcp_conn_state_t *tcp_conn_state;
+	sockinfo_t *socks;
 
 	perf_dnsctx_t *dnsctx;
 
@@ -609,28 +614,28 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 	for (i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
 		if (*socknum == tinfo->nsocks)
 			(*socknum) = 0;
-		if (tinfo->socks[*socknum] == -1 ||
-		    tinfo->tcp_conn_state[*socknum] == TCP_CLOSED ||
-		    tinfo->tcp_conn_state[*socknum] == TCP_SENT_MAX)
+		sockinfo_t *sock = &tinfo->socks[*socknum];
+		if (sock->fd == -1 ||
+		    sock->state == SOCKET_CLOSED ||
+		    sock->state == SOCKET_TCP_SENT_MAX)
 			continue;
-		if (tinfo->tcp_conn_state[*socknum] == TCP_IN_HANDSHAKE) {
-			if (perf_os_waituntilwriteable(tinfo->socks[*socknum], 0)
+		if (sock->state == SOCKET_TCP_HANDSHAKE) {
+			if (perf_os_waituntilwriteable(sock->fd, 0)
 			                                  != ISC_R_SUCCESS)
 				continue;
 			LOCK(&tinfo->lock);
-			tinfo->tcp_conn_state[*socknum] = TCP_OK;
+			sock->state = SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
 		}
 		int error = 0;
 		socklen_t len = (socklen_t)sizeof(error);
-		getsockopt(tinfo->socks[*socknum], SOL_SOCKET, SO_ERROR, 
-		           (void*)&error, &len);
+		getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, (void*)&error, &len);
 		if (error == EINPROGRESS || error == EWOULDBLOCK || error == EAGAIN) {
 			continue;
 		} else if (error != 0) {
 			/* TODO: Need to reset the connection again */
 			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
-			               *socknum, tinfo->socks[*socknum], strerror(error));
+			               *socknum, sock->fd, strerror(error));
 			continue;
 		}
 		return ISC_TRUE;
@@ -719,7 +724,7 @@ do_send(void *arg)
 		q = ISC_LIST_HEAD(tinfo->unused_queries);
 		query_move(tinfo, q, prepend_outstanding);
 		q->timestamp = ISC_UINT64_MAX;
-		q->sock = tinfo->socks[socknum];
+		q->sock = &tinfo->socks[socknum];
 
 		UNLOCK(&tinfo->lock);
 
@@ -767,7 +772,7 @@ do_send(void *arg)
 				perf_log_fatal("out of memory");
 		}
 		q->timestamp = now;
-		n = sendto(q->sock, base, length, 0,
+		n = sendto(q->sock->fd, base, length, 0,
 			   &config->server_addr.type.sa,
 			   config->server_addr.length);
 		if (n < 0 || (unsigned int) n != length) {
@@ -781,11 +786,11 @@ do_send(void *arg)
 
 		if (tinfo->config->usetcp == ISC_TRUE) {
 			LOCK(&tinfo->lock);
-			tinfo->sock_num_sent[socknum]++;
+			q->sock->num_sent++;
 			if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
-				tinfo->sock_num_sent[socknum] !=0 &&
-				tinfo->sock_num_sent[socknum] == tinfo->config->max_tcp_q) {
-				tinfo->tcp_conn_state[socknum] = TCP_SENT_MAX;
+				q->sock->num_sent != 0 &&
+				q->sock->num_sent == tinfo->config->max_tcp_q) {
+				q->sock->state = SOCKET_TCP_SENT_MAX;
 			}
 			UNLOCK(&tinfo->lock);
 		}
@@ -834,7 +839,7 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 }
 
 typedef struct {
-	int sock;
+	sockinfo_t *sock;
 	isc_uint16_t qid;
 	isc_uint16_t rcode;
 	unsigned int size;
@@ -851,7 +856,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	 received_query_t *recvd, int *saved_errnop)
 {
 	isc_uint16_t *packet_header;
-	int s;
+	sockinfo_t *s;
 	isc_uint64_t now;
 	int n;
 	uint8_t tcplength[2];
@@ -861,19 +866,19 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 
 	packet_header = (isc_uint16_t *) packet_buffer;
 
-	s = tinfo->socks[which_sock];
+	s = &tinfo->socks[which_sock];
 
 	if (tinfo->config->usetcp != ISC_TRUE) {
-		n = recv(s, packet_buffer, packet_size, 0);
+		n = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
 		/* check if there are enough bytes available to read the length */
-		if (ioctl(s, FIONREAD, &avbytes) == -1){
+		if (ioctl(s->fd, FIONREAD, &avbytes) == -1){
 			*saved_errnop = errno;
 			return ISC_FALSE;
 		}
 		if (avbytes >= 2) {
 			/* first just peek at the length */
-			if ( (bytes_read = recv(s, tcplength, 2, MSG_PEEK)) == -1) {
+			if ( (bytes_read = recv(s->fd, tcplength, 2, MSG_PEEK)) == -1) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
 			}
@@ -888,18 +893,18 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 			return ISC_FALSE;
 		}
 		/* check if there are enough bytes available */
-		if (ioctl(s, FIONREAD, &avbytes) == -1){
+		if (ioctl(s->fd, FIONREAD, &avbytes) == -1){
 			*saved_errnop = errno;
 			return ISC_FALSE;
 		}
 		if (avbytes >= (2 + n)) {
 			/* drain the length bytes */
-			if ( (bytes_read = read(s, tcplength, 2)) == -1) {
+			if ( (bytes_read = read(s->fd, tcplength, 2)) == -1) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
 			}
 			/* now read the DNS payload */
-			if ( (p_bytes_read = read(s, packet_buffer, n)) == -1) {
+			if ( (p_bytes_read = read(s->fd, packet_buffer, n)) == -1) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
 			}
@@ -952,18 +957,20 @@ bit_check(unsigned char *bits, unsigned int bit)
 static isc_boolean_t
 check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 {
+	sockinfo_t *sock;
 	if (tinfo->done_sending)
 		return ISC_TRUE;
-	if (tinfo->socks[socket] ==  -1)
+	sock = &tinfo->socks[socket];
+	if (sock->fd ==  -1)
 		return ISC_FALSE;
-	if (tinfo->tcp_conn_state[socket] == TCP_SENT_MAX &&
-	    tinfo->sock_num_recv[socket] >= tinfo->config->max_tcp_q) {
-		close(tinfo->socks[socket]);
+	if (sock->state == SOCKET_TCP_SENT_MAX &&
+	    sock->num_recv >= tinfo->config->max_tcp_q) {
+		close(sock->fd);
 		LOCK(&tinfo->lock);
-		tinfo->socks[socket] = -1;
-		tinfo->sock_num_sent[socket] = 0;
-		tinfo->sock_num_recv[socket] = 0;
-		tinfo->tcp_conn_state[socket] = TCP_CLOSED;
+		sock->fd = -1;
+		sock->num_sent = 0;
+		sock->num_recv = 0;
+		sock->state = SOCKET_CLOSED;
 		UNLOCK(&tinfo->lock);
 		/* We can't easily re-open the same port because we have
 		the TIME_WAIT state, so for now disregard the -x option here*/
@@ -975,8 +982,8 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 			return ISC_FALSE;
 		stats->num_tcp_conns++;
 		LOCK(&tinfo->lock);
-		tinfo->socks[socket] = fd;
-		tinfo->tcp_conn_state[socket] = TCP_IN_HANDSHAKE;
+		sock->fd = fd;
+		sock->state = SOCKET_TCP_HANDSHAKE;
 		UNLOCK(&tinfo->lock);
 	}
 	return ISC_TRUE;
@@ -1035,7 +1042,7 @@ do_recv(void *arg)
 				{
 					last_socket = (current_socket + 1);
 					if (tinfo->config->usetcp == ISC_TRUE)
-						tinfo->sock_num_recv[current_socket]++;
+						tinfo->socks[current_socket].num_recv++;
 					break;
 				}
 				bit_set(socketbits, current_socket);
@@ -1115,11 +1122,14 @@ do_recv(void *arg)
 			if (saved_errno == EINTR) {
 				continue;
 			} else if (saved_errno == EAGAIN) {
+				int fds[MAX_SOCKETS];
+				for (int i = 0; i < tinfo->nsocks; ++i)
+					fds[i] = tinfo->socks[i].fd;
 				perf_os_waituntilanyreadable(
-							tinfo->socks,
-							tinfo->nsocks,
-							threadpipe[0],
-							TIMEOUT_CHECK_TIME);
+					fds,
+					tinfo->nsocks,
+					threadpipe[0],
+					TIMEOUT_CHECK_TIME);
 				now = get_time();
 				continue;
 			} else {
@@ -1245,22 +1255,9 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 	if (tinfo->nsocks > MAX_SOCKETS)
 		tinfo->nsocks = MAX_SOCKETS;
 
-	tinfo->socks = isc_mem_get(mctx, tinfo->nsocks * sizeof(int));
+	tinfo->socks = isc_mem_get(mctx, tinfo->nsocks * sizeof(sockinfo_t));
 	if (tinfo->socks == NULL)
 		perf_log_fatal("out of memory");
-
-	/* If we are using TCP create a counter for each socket to record number of queries sent */
-	if (tinfo->config->usetcp == ISC_TRUE) {
-		tinfo->sock_num_sent= isc_mem_get(mctx, tinfo->nsocks * sizeof(isc_uint64_t));
-		if (tinfo->sock_num_sent == NULL)
-			perf_log_fatal("out of memory");
-		tinfo->sock_num_recv= isc_mem_get(mctx, tinfo->nsocks * sizeof(isc_uint64_t));
-		if (tinfo->sock_num_recv == NULL)
-			perf_log_fatal("out of memory");
-		tinfo->tcp_conn_state= isc_mem_get(mctx, tinfo->nsocks * sizeof(int));
-		if (tinfo->tcp_conn_state == NULL)
-			perf_log_fatal("out of memory");
-	}
 
 	socket_offset = 0;
 	int sock_type = SOCK_DGRAM;
@@ -1270,16 +1267,16 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 		if (tinfo->config->usetcp == ISC_TRUE) {
 			sock_type = SOCK_STREAM;
 			tinfo->stats.num_tcp_conns++;
-			tinfo->sock_num_sent[i] = 0;
-			tinfo->sock_num_recv[i] = 0;
-			tinfo->tcp_conn_state[i] = TCP_CLOSED;
+			tinfo->socks[i].num_sent = 0;
+			tinfo->socks[i].num_recv = 0;
+			tinfo->socks[i].state = SOCKET_CLOSED;
 		}
-		tinfo->socks[i] = perf_net_opensocket(&config->server_addr,
-						      &config->local_addr,
-						      socket_offset++,
-						      config->bufsize, sock_type);
-		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i] != -1)
-			tinfo->tcp_conn_state[i] = TCP_IN_HANDSHAKE;
+		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
+							 &config->local_addr,
+							 socket_offset++,
+							 config->bufsize, sock_type);
+		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i].fd != -1)
+			tinfo->socks[i].state = SOCKET_TCP_HANDSHAKE;
 	}
 	tinfo->current_sock = 0;
 
@@ -1303,13 +1300,8 @@ threadinfo_cleanup(threadinfo_t *tinfo, times_t *times)
 	if (interrupted)
 		cancel_queries(tinfo);
 	for (i = 0; i < tinfo->nsocks; i++)
-		close(tinfo->socks[i]);
-	if (tinfo->config->usetcp == ISC_TRUE) {
-		isc_mem_put(mctx, tinfo->sock_num_recv, tinfo->nsocks * sizeof(isc_uint64_t));
-		isc_mem_put(mctx, tinfo->tcp_conn_state, tinfo->nsocks * sizeof(int));
-		isc_mem_put(mctx, tinfo->sock_num_sent, tinfo->nsocks * sizeof(isc_uint64_t));
-	}
-	isc_mem_put(mctx, tinfo->socks, tinfo->nsocks * sizeof(int));
+		close(tinfo->socks[i].fd);
+	isc_mem_put(mctx, tinfo->socks, tinfo->nsocks * sizeof(sockinfo_t));
 	perf_dns_destroyctx(&tinfo->dnsctx);
 	if (tinfo->last_recv > times->end_time)
 		times->end_time = tinfo->last_recv;
