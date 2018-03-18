@@ -161,7 +161,8 @@ typedef enum {
 	SOCKET_CLOSED,
 	SOCKET_TCP_HANDSHAKE,
 	SOCKET_TCP_SENT_MAX,
-	SOCKET_SENDING
+	SOCKET_SENDING,
+	SOCKET_READING
 } socket_state_t;
 
 typedef struct 
@@ -172,6 +173,7 @@ typedef struct
 	socket_state_t state;
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
+	unsigned int tcp_to_read;
 } sockinfo_t;
 
 typedef ISC_LIST(struct query_info) query_list;
@@ -867,6 +869,25 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 	UNLOCK(&tinfo->lock);
 }
 
+int count_pending(threadinfo_t *tinfo, sockinfo_t *s)
+{
+	(void) tinfo;
+	int avbytes = 0;
+	if (ioctl(s->fd, FIONREAD, &avbytes) == -1)
+		return errno;
+	return avbytes;
+}
+
+int recv_buf(threadinfo_t *tinfo, sockinfo_t *s, unsigned char *buf, unsigned int buflen)
+{
+	(void) tinfo;
+	int bytes_read = recv(s->fd, buf, buflen, 0);
+	if (bytes_read == -1)
+		return errno;
+	else
+		return bytes_read;
+}
+
 typedef struct {
 	sockinfo_t *sock;
 	isc_uint16_t qid;
@@ -890,8 +911,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	int n;
 	uint8_t tcplength[2];
 	int bytes_read = 0;
-	int p_bytes_read = 0;
-	int avbytes = 0;
+	int pending = 0;
 
 	packet_header = (isc_uint16_t *) packet_buffer;
 
@@ -900,46 +920,48 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	if (tinfo->config->usetcp != ISC_TRUE) {
 		n = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
-		/* check if there are enough bytes available to read the length */
-		if (ioctl(s->fd, FIONREAD, &avbytes) == -1){
-			*saved_errnop = errno;
-			return ISC_FALSE;
-		}
-		if (avbytes >= 2) {
-			/* first just peek at the length */
-			if ( (bytes_read = recv(s->fd, tcplength, 2, MSG_PEEK)) == -1) {
+		if (s->state != SOCKET_READING) {			
+			pending = count_pending(tinfo, s);
+			if (pending < 0) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
 			}
-		} else {
-			*saved_errnop = EAGAIN;
-			return ISC_FALSE;
+			if (pending >= 2) {
+				bytes_read = recv_buf(tinfo, s, tcplength, 2);
+				if (bytes_read != 2) {
+					perf_log_warning("bad read length");
+					*saved_errnop = EBADMSG; /* return bad message */
+					return ISC_FALSE;
+				}
+				LOCK(&tinfo->lock);
+				s->tcp_to_read = ((uint16_t)tcplength[0] << 8) | tcplength[1];
+				s->state = SOCKET_READING;
+				UNLOCK(&tinfo->lock);
+			} else {
+				*saved_errnop = EAGAIN;
+				return ISC_FALSE;
+			}
 		}
-		n = ((uint16_t)tcplength[0] << 8) | tcplength[1];
-		if( n == 0 ) {
-			perf_log_warning("length was 0");
-			*saved_errnop = EBADMSG; /* return bad message */
-			return ISC_FALSE;
-		}
-		/* check if there are enough bytes available */
-		if (ioctl(s->fd, FIONREAD, &avbytes) == -1){
-			*saved_errnop = errno;
-			return ISC_FALSE;
-		}
-		if (avbytes >= (2 + n)) {
-			/* drain the length bytes */
-			if ( (bytes_read = read(s->fd, tcplength, 2)) == -1) {
+		if (s->state == SOCKET_READING) {
+			pending = count_pending(tinfo, s);
+			if (pending < 0) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
 			}
-			/* now read the DNS payload */
-			if ( (p_bytes_read = read(s->fd, packet_buffer, n)) == -1) {
-				*saved_errnop = errno;
+			if (pending >= s->tcp_to_read) {
+				bytes_read = recv_buf(tinfo, s, packet_buffer, s->tcp_to_read);
+				if (bytes_read != s->tcp_to_read) {
+					perf_log_warning("bad read length");
+					*saved_errnop = EBADMSG; /* return bad message */
+					return ISC_FALSE;
+				}
+				LOCK(&tinfo->lock);
+				s->state = SOCKET_FREE;
+				UNLOCK(&tinfo->lock);
+			} else {
+				*saved_errnop = EAGAIN;
 				return ISC_FALSE;
 			}
-		} else {
-			*saved_errnop = EAGAIN;
-			return ISC_FALSE;
 		}
 	}
 	
