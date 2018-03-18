@@ -160,7 +160,8 @@ typedef enum {
 	SOCKET_FREE,
 	SOCKET_CLOSED,
 	SOCKET_TCP_HANDSHAKE,
-	SOCKET_TCP_SENT_MAX
+	SOCKET_TCP_SENT_MAX,
+	SOCKET_SENDING
 } socket_state_t;
 
 typedef struct 
@@ -169,6 +170,8 @@ typedef struct
 	isc_uint64_t num_recv;
 	isc_uint64_t num_sent;
 	socket_state_t state;
+	isc_buffer_t sending;
+	unsigned char sending_buffer[MAX_EDNS_PACKET];
 } sockinfo_t;
 
 typedef ISC_LIST(struct query_info) query_list;
@@ -607,11 +610,45 @@ wait_for_start(void)
 	UNLOCK(&start_lock);
 }
 
+static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
+{
+	unsigned int length = isc_buffer_usedlength(msg);
+	int res = sendto(s->fd,
+			 isc_buffer_base(msg), length,
+			 0,
+			 &tinfo->config->server_addr.type.sa,
+			 tinfo->config->server_addr.length);
+	if (res < 0) {
+		if (res == EWOULDBLOCK || res == EINPROGRESS)
+			res = EAGAIN;
+		if (res != EAGAIN)
+			perf_log_warning("failed to send packet: %s",
+					 strerror(errno));
+	} else if ((unsigned int) res != length)
+		perf_log_fatal("unexpected short write: %s", strerror(errno));
+	else {
+		if (tinfo->config->usetcp == ISC_TRUE) {
+			LOCK(&tinfo->lock);
+			s->num_sent++;
+			if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
+			    s->num_sent != 0 &&
+			    s->num_sent == tinfo->config->max_tcp_q) {
+				s->state = SOCKET_TCP_SENT_MAX;
+			}
+			if (s->state == SOCKET_SENDING)
+				s->state = SOCKET_FREE;
+			UNLOCK(&tinfo->lock);
+		}
+	}
+	return res;
+}
+
 static isc_boolean_t
 find_working_tcp_connection(int *socknum, threadinfo_t *tinfo) 
 {
-	int i;
+	int i, error;
 	for (i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
+		error = 0;
 		if (*socknum == tinfo->nsocks)
 			(*socknum) = 0;
 		sockinfo_t *sock = &tinfo->socks[*socknum];
@@ -619,6 +656,11 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 		    sock->state == SOCKET_CLOSED ||
 		    sock->state == SOCKET_TCP_SENT_MAX)
 			continue;
+		if (sock->state == SOCKET_SENDING) {
+			error = send_msg(tinfo, sock, &sock->sending);
+			if (error == EAGAIN)
+				continue;
+		}
 		if (sock->state == SOCKET_TCP_HANDSHAKE) {
 			if (perf_os_waituntilwriteable(sock->fd, 0)
 			                                  != ISC_R_SUCCESS)
@@ -626,12 +668,6 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			LOCK(&tinfo->lock);
 			sock->state = SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
-		}
-		int error = 0;
-		socklen_t len = (socklen_t)sizeof(error);
-		getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, (void*)&error, &len);
-		if (error == EINPROGRESS || error == EWOULDBLOCK || error == EAGAIN) {
-			continue;
 		} else if (error != 0) {
 			/* TODO: Need to reset the connection again */
 			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
@@ -772,27 +808,20 @@ do_send(void *arg)
 				perf_log_fatal("out of memory");
 		}
 		q->timestamp = now;
-		n = sendto(q->sock->fd, base, length, 0,
-			   &config->server_addr.type.sa,
-			   config->server_addr.length);
-		if (n < 0 || (unsigned int) n != length) {
-			perf_log_warning("failed to send packet: %s",
-					 strerror(errno));
-			LOCK(&tinfo->lock);
-			query_move(tinfo, q, prepend_unused);
-			UNLOCK(&tinfo->lock);
-			continue;
-		}
+		n = send_msg(tinfo, q->sock, &msg);
 
-		if (tinfo->config->usetcp == ISC_TRUE) {
-			LOCK(&tinfo->lock);
-			q->sock->num_sent++;
-			if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
-				q->sock->num_sent != 0 &&
-				q->sock->num_sent == tinfo->config->max_tcp_q) {
-				q->sock->state = SOCKET_TCP_SENT_MAX;
+		if (n < 0) {
+			if (n == EAGAIN) {
+				LOCK(&tinfo->lock);
+				q->sock->state = SOCKET_SENDING;
+				isc_buffer_reinit(&q->sock->sending, base, length);
+				UNLOCK(&tinfo->lock);
+			} else {
+				LOCK(&tinfo->lock);
+				query_move(tinfo, q, prepend_unused);
+				UNLOCK(&tinfo->lock);
+				continue;
 			}
-			UNLOCK(&tinfo->lock);
 		}
 		stats->num_sent++;
 		stats->total_request_size += length;
@@ -1264,11 +1293,13 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 	for (i = 0; i < offset; i++)
 		socket_offset += threads[i].nsocks;
 	for (i = 0; i < tinfo->nsocks; i++) {
+		tinfo->socks[i].state = SOCKET_FREE;
 		if (tinfo->config->usetcp == ISC_TRUE) {
 			sock_type = SOCK_STREAM;
 			tinfo->stats.num_tcp_conns++;
 			tinfo->socks[i].num_sent = 0;
 			tinfo->socks[i].num_recv = 0;
+			isc_buffer_init(&tinfo->socks[i].sending, tinfo->socks[i].sending_buffer, MAX_EDNS_PACKET);
 			tinfo->socks[i].state = SOCKET_CLOSED;
 		}
 		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
