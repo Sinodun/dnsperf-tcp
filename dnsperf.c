@@ -179,8 +179,7 @@ typedef struct
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
 	unsigned int tcp_to_read;
-	SSL *ssl_read;
-	SSL *ssl_write;
+	SSL *ssl;
 } sockinfo_t;
 
 typedef ISC_LIST(struct query_info) query_list;
@@ -629,20 +628,34 @@ wait_for_start(void)
 
 static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 {
+	int res, err;
 	unsigned int length = isc_buffer_usedlength(msg);
-	int res = sendto(s->fd,
-			 isc_buffer_base(msg), length,
-			 0,
-			 &tinfo->config->server_addr.type.sa,
-			 tinfo->config->server_addr.length);
+	if (tinfo->config->usetcptls) {
+		LOCK(&tinfo->lock);
+		res = SSL_write(s->ssl, isc_buffer_base(msg), length);
+		err = SSL_get_error(s->ssl, res);
+		UNLOCK(&tinfo->lock);
+		if (res <= 0) {
+			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+				res = EAGAIN;
+			else
+				res = err;
+		}
+	} else {
+		res = sendto(s->fd,
+			     isc_buffer_base(msg), length,
+			     0,
+			     &tinfo->config->server_addr.type.sa,
+			     tinfo->config->server_addr.length);
+	}
 	if (res < 0) {
 		if (res == EWOULDBLOCK || res == EINPROGRESS)
 			res = EAGAIN;
 		if (res != EAGAIN)
-			perf_log_warning("failed to send packet: %s",
-					 strerror(errno));
+			perf_log_warning("failed to send packet: %d",
+					 errno);
 	} else if ((unsigned int) res != length)
-		perf_log_fatal("unexpected short write: %s", strerror(errno));
+		perf_log_fatal("unexpected short write: %d", errno);
 	else {
 		if (tinfo->config->usetcp == ISC_TRUE) {
 			LOCK(&tinfo->lock);
@@ -692,20 +705,28 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			continue;
 		}
 		if (sock->state == SOCKET_TLS_HANDSHAKE) {
-			switch(SSL_connect(sock->ssl_write)) {
+			LOCK(&tinfo->lock);
+			int res = SSL_connect(sock->ssl);
+			error = SSL_get_error(sock->ssl, res);
+			UNLOCK(&tinfo->lock);
+			switch(res) {
 			case 0:
-				perf_log_fatal("SSL connect: %s",
-					       ERR_reason_error_string(ERR_get_error()));
+				perf_log_fatal("SSL connect fail: %d", error);
 				break;
 
 			case 1:
+				printf("SSL connected\n");
 				LOCK(&tinfo->lock);
 				sock->state = SOCKET_FREE;
 				UNLOCK(&tinfo->lock);
 				break;
 
 			default:
-				continue;
+				if (error == SSL_ERROR_WANT_READ ||
+				    error == SSL_ERROR_WANT_WRITE)
+					continue;
+				perf_log_fatal("SSL connect bad fail: %d (%s)", error, strerror(errno));
+				break;
 			}
 		}
 		return ISC_TRUE;
@@ -903,21 +924,40 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 
 int count_pending(threadinfo_t *tinfo, sockinfo_t *s)
 {
-	(void) tinfo;
-	int avbytes = 0;
-	if (ioctl(s->fd, FIONREAD, &avbytes) == -1)
-		return errno;
-	return avbytes;
+	if (tinfo->config->usetcptls) {
+		int res;
+		LOCK(&tinfo->lock);
+		SSL_read(s->ssl, NULL, 0);
+		res = SSL_pending(s->ssl);
+		UNLOCK(&tinfo->lock);
+		return res;
+	} else {
+		int avbytes = 0;
+		if (ioctl(s->fd, FIONREAD, &avbytes) == -1)
+			return errno;
+		return avbytes;
+	}
 }
 
 int recv_buf(threadinfo_t *tinfo, sockinfo_t *s, unsigned char *buf, unsigned int buflen)
 {
-	(void) tinfo;
-	int bytes_read = recv(s->fd, buf, buflen, 0);
-	if (bytes_read == -1)
-		return errno;
-	else
-		return bytes_read;
+	int bytes_read, error;
+	if (tinfo->config->usetcptls) {
+		LOCK(&tinfo->lock);
+		bytes_read = SSL_read(s->ssl, buf, buflen);
+		error = SSL_get_error(s->ssl, bytes_read);
+		UNLOCK(&tinfo->lock);
+		if (bytes_read <= 0)
+			return error;
+		else
+			return bytes_read;
+	} else {
+		bytes_read = recv(s->fd, buf, buflen, 0);
+		if (bytes_read == -1)
+			return errno;
+		else
+			return bytes_read;
+	}
 }
 
 typedef struct {
@@ -1041,16 +1081,11 @@ static void
 setup_ssl(threadinfo_t *tinfo, sockinfo_t *s)
 {
 	if (tinfo->config->usetcptls == ISC_TRUE) {
-		s->ssl_read = SSL_new(ctx);
-		if (s->ssl_read == NULL)
-			perf_log_fatal("creating SSL read object: %s",
+		s->ssl = SSL_new(ctx);
+		if (s->ssl == NULL)
+			perf_log_fatal("creating SSL object: %s",
 				       ERR_reason_error_string(ERR_get_error()));
-		SSL_set_fd(s->ssl_read, s->fd);
-		s->ssl_write = SSL_new(ctx);
-		if (s->ssl_write == NULL)
-			perf_log_fatal("creating SSL write object: %s",
-				       ERR_reason_error_string(ERR_get_error()));
-		SSL_set_fd(s->ssl_write, s->fd);
+		SSL_set_fd(s->ssl, s->fd);
 	}
 }
 
@@ -1071,13 +1106,9 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		sock->num_sent = 0;
 		sock->num_recv = 0;
 		sock->state = SOCKET_CLOSED;
-		if (sock->ssl_read != NULL) {
-			SSL_free(sock->ssl_read);
-			sock->ssl_read = NULL;
-		}
-		if (sock->ssl_write != NULL) {
-			SSL_free(sock->ssl_write);
-			sock->ssl_write = NULL;
+		if (sock->ssl != NULL) {
+			SSL_free(sock->ssl);
+			sock->ssl = NULL;
 		}
 		UNLOCK(&tinfo->lock);
 		/* We can't easily re-open the same port because we have
@@ -1381,14 +1412,16 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 			tinfo->socks[i].num_recv = 0;
 			isc_buffer_init(&tinfo->socks[i].sending, tinfo->socks[i].sending_buffer, MAX_EDNS_PACKET);
 			tinfo->socks[i].state = SOCKET_CLOSED;
-			setup_ssl(tinfo, &tinfo->socks[i]);
+			tinfo->socks[i].ssl = NULL;
 		}
 		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
 							 &config->local_addr,
 							 socket_offset++,
 							 config->bufsize, sock_type);
-		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i].fd != -1)
+		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i].fd != -1) {
 			tinfo->socks[i].state = SOCKET_TCP_HANDSHAKE;
+			setup_ssl(tinfo, &tinfo->socks[i]);
+		}
 	}
 	tinfo->current_sock = 0;
 
