@@ -98,6 +98,7 @@
 
 #define DEFAULT_SERVER_NAME		"127.0.0.1"
 #define DEFAULT_SERVER_PORT		53
+#define DEFAULT_TLS_SERVER_PORT		853
 #define DEFAULT_LOCAL_PORT		0
 #define DEFAULT_MAX_OUTSTANDING		100
 #define DEFAULT_TIMEOUT			5
@@ -425,21 +426,15 @@ sum_stats(const config_t *config, stats_t *total)
 	}
 }
 
-static char *
-stringify(unsigned int value)
-{
-	static char buf[20];
-
-	snprintf(buf, sizeof(buf), "%u", value);
-	return buf;
-}
+#define str(x) #x
+#define stringify(x) str(x)
 
 static void
 setup(int argc, char **argv, config_t *config)
 {
 	const char *family = NULL;
 	const char *server_name = DEFAULT_SERVER_NAME;
-	in_port_t server_port = DEFAULT_SERVER_PORT;
+	in_port_t server_port = 0;
 	const char *local_name = NULL;
 	in_port_t local_port = DEFAULT_LOCAL_PORT;
 	const char *filename = NULL;
@@ -470,7 +465,8 @@ setup(int argc, char **argv, config_t *config)
 		     "the server to query", DEFAULT_SERVER_NAME, &server_name);
 	perf_opt_add('p', perf_opt_port, "port",
 		     "the port on which to query the server",
-		     stringify(DEFAULT_SERVER_PORT), &server_port);
+		     stringify(DEFAULT_SERVER_PORT) " or " stringify(DEFAULT_TLS_SERVER_PORT) " for TCP/TLS",
+		     &server_port);
 	perf_opt_add('a', perf_opt_string, "local_addr",
 		     "the local address from which to send queries", NULL,
 		     &local_name);
@@ -533,6 +529,9 @@ setup(int argc, char **argv, config_t *config)
  		     &config->max_tcp_q);	
 	perf_opt_parse(argc, argv);
 
+        if (server_port == 0)
+            server_port = (config->usetcptls) ? DEFAULT_TLS_SERVER_PORT : DEFAULT_SERVER_PORT;
+        
 	if (family != NULL)
 		config->family = perf_net_parsefamily(family);
 	perf_net_parseserver(config->family, server_name, server_port,
