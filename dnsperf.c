@@ -177,6 +177,7 @@ typedef struct
 	isc_uint64_t num_recv;
 	isc_uint64_t num_sent;
 	socket_state_t state;
+	socket_state_t recv_state;
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
 	unsigned int tcp_to_read;
@@ -991,7 +992,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	if (tinfo->config->usetcp != ISC_TRUE) {
 		bytes_read = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
-		if (s->state != SOCKET_READING) {
+		if (s->recv_state != SOCKET_READING) {
 			pending = count_pending(tinfo, s);
 			if (pending < 0) {
 				*saved_errnop = errno;
@@ -1006,7 +1007,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 				}
 				LOCK(&tinfo->lock);
 				s->tcp_to_read = ((uint16_t)tcplength[0] << 8) | tcplength[1];
-				s->state = SOCKET_READING;
+				s->recv_state = SOCKET_READING;
 				UNLOCK(&tinfo->lock);
 			} else {
 				*saved_errnop = EAGAIN;
@@ -1027,7 +1028,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 				return ISC_FALSE;
 			}
 			LOCK(&tinfo->lock);
-			s->state = SOCKET_FREE;
+			s->recv_state = SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
 		} else {
 			*saved_errnop = EAGAIN;
@@ -1121,8 +1122,9 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		LOCK(&tinfo->lock);
 		sock->fd = fd;
 		sock->state = SOCKET_TCP_HANDSHAKE;
-		setup_ssl(tinfo, sock);
+		sock->recv_state = SOCKET_TCP_HANDSHAKE;
 		UNLOCK(&tinfo->lock);
+		setup_ssl(tinfo, sock);
 	}
 	return ISC_TRUE;
 }
