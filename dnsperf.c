@@ -651,8 +651,8 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 		if (res == EWOULDBLOCK || res == EINPROGRESS)
 			res = EAGAIN;
 		if (res != EAGAIN)
-			perf_log_warning("failed to send packet: %d",
-					 errno);
+			perf_log_warning("failed to send packet: %d (%s)",
+					 errno, strerror(errno));
 	} else if ((unsigned int) res != length)
 		perf_log_fatal("unexpected short write: %d", errno);
 	else {
@@ -714,7 +714,6 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 				break;
 
 			case 1:
-				printf("SSL connected\n");
 				LOCK(&tinfo->lock);
 				sock->state = SOCKET_FREE;
 				UNLOCK(&tinfo->lock);
@@ -724,7 +723,7 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 				if (error == SSL_ERROR_WANT_READ ||
 				    error == SSL_ERROR_WANT_WRITE)
 					continue;
-				perf_log_fatal("SSL connect bad fail: %d (%s)", error, strerror(errno));
+				perf_log_fatal("SSL connect bad fail: %d", error);
 				break;
 			}
 		}
