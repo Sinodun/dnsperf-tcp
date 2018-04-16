@@ -1467,7 +1467,11 @@ main(int argc, char **argv)
 	SSL_library_init();
 	OpenSSL_add_all_algorithms();
 	SSL_load_error_strings();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+	method = SSLv23_client_method();
+#else
 	method = TLS_client_method();
+#endif
 	ctx = SSL_CTX_new(method);
 	if (ctx == NULL)
 		perf_log_fatal("creating SSL context: %s",
