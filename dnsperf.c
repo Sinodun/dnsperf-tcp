@@ -979,7 +979,6 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	isc_uint16_t *packet_header;
 	sockinfo_t *s;
 	isc_uint64_t now;
-	int n;
 	uint8_t tcplength[2];
 	int bytes_read = 0;
 	int pending = 0;
@@ -989,9 +988,9 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 	s = &tinfo->socks[which_sock];
 
 	if (tinfo->config->usetcp != ISC_TRUE) {
-		n = recv(s->fd, packet_buffer, packet_size, 0);
+		bytes_read = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
-		if (s->state != SOCKET_READING) {			
+		if (s->state != SOCKET_READING) {
 			pending = count_pending(tinfo, s);
 			if (pending < 0) {
 				*saved_errnop = errno;
@@ -1013,42 +1012,41 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 				return ISC_FALSE;
 			}
 		}
-		if (s->state == SOCKET_READING) {
-			pending = count_pending(tinfo, s);
-			if (pending < 0) {
-				*saved_errnop = errno;
+		/* Now in SOCKET_READING */
+		pending = count_pending(tinfo, s);
+		if (pending < 0) {
+			*saved_errnop = errno;
+			return ISC_FALSE;
+		}
+		if (pending >= s->tcp_to_read) {
+			bytes_read = recv_buf(tinfo, s, packet_buffer, s->tcp_to_read);
+			if (bytes_read != s->tcp_to_read) {
+				perf_log_warning("bad read length");
+				*saved_errnop = EBADMSG; /* return bad message */
 				return ISC_FALSE;
 			}
-			if (pending >= s->tcp_to_read) {
-				bytes_read = recv_buf(tinfo, s, packet_buffer, s->tcp_to_read);
-				if (bytes_read != s->tcp_to_read) {
-					perf_log_warning("bad read length");
-					*saved_errnop = EBADMSG; /* return bad message */
-					return ISC_FALSE;
-				}
-				LOCK(&tinfo->lock);
-				s->state = SOCKET_FREE;
-				UNLOCK(&tinfo->lock);
-			} else {
-				*saved_errnop = EAGAIN;
-				return ISC_FALSE;
-			}
+			LOCK(&tinfo->lock);
+			s->state = SOCKET_FREE;
+			UNLOCK(&tinfo->lock);
+		} else {
+			*saved_errnop = EAGAIN;
+			return ISC_FALSE;
 		}
 	}
 	
 	now = get_time();
-	if (n < 0) {
+	if (bytes_read < 0) {
 		*saved_errnop = errno;
 		return ISC_FALSE;
 	}
 	recvd->sock = s;
 	recvd->qid = ntohs(packet_header[0]);
 	recvd->rcode = ntohs(packet_header[1]) & 0xF;
-	recvd->size = n;
+	recvd->size = bytes_read;
 	recvd->when = now;
 	recvd->sent = 0;
 	recvd->unexpected = ISC_FALSE;
-	recvd->short_response = ISC_TF(n < 4);
+	recvd->short_response = ISC_TF(bytes_read < 4);
 	recvd->desc = NULL;
 	return ISC_TRUE;
 }
