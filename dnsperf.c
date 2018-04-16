@@ -251,7 +251,8 @@ static void
 handle_sigint(int sig)
 {
 	(void)sig;
-	write(intrpipe[1], "", 1);
+	int unused = write(intrpipe[1], "", 1);
+	(void)unused;
 }
 
 static void
@@ -881,7 +882,8 @@ do_send(void *arg)
 	}
 	tinfo->done_send_time = get_time();
 	tinfo->done_sending = ISC_TRUE;
-	write(mainpipe[1], "", 1);
+	int unused = write(mainpipe[1], "", 1);
+	(void)unused;
 	return NULL;
 }
 
@@ -1517,11 +1519,12 @@ main(int argc, char **argv)
 
 	times.end_time = get_time();
 
-	write(threadpipe[1], "", 1);
+	int unused = write(threadpipe[1], "", 1);
+	(void)unused;
 	for (i = 0; i < config.threads; i++)
-		threadinfo_stop(&threads[i]);
+	    threadinfo_stop(&threads[i]);
 	if (config.stats_interval > 0)
-		JOIN(stats_thread.sender, NULL);
+	    JOIN(stats_thread.sender, NULL);
 
 	for (i = 0; i < config.threads; i++)
 		threadinfo_cleanup(&threads[i], &times);
