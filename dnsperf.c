@@ -629,18 +629,18 @@ wait_for_start(void)
 
 static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 {
-	int res, err;
+	int error = 0, res, ssl_err;
 	unsigned int length = isc_buffer_usedlength(msg);
 	if (tinfo->config->usetcptls) {
 		LOCK(&tinfo->lock);
 		res = SSL_write(s->ssl, isc_buffer_base(msg), length);
-		err = SSL_get_error(s->ssl, res);
+		ssl_err = SSL_get_error(s->ssl, res);
 		UNLOCK(&tinfo->lock);
 		if (res <= 0) {
-			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-				res = EAGAIN;
+			if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+				error = EAGAIN;
 			else
-				res = err;
+				error = ssl_err;
 		}
 	} else {
 		res = sendto(s->fd,
@@ -648,30 +648,32 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 			     0,
 			     &tinfo->config->server_addr.type.sa,
 			     tinfo->config->server_addr.length);
+		if (res < 0) {
+			if (errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EAGAIN)
+				error = EAGAIN;
+			else
+				error = errno;
+			if (error != EAGAIN)
+				perf_log_warning("failed to send packet: %d (%s)",
+						 errno, strerror(errno));
+		} else if ((unsigned int) res != length)
+			perf_log_fatal("unexpected short write: %d", errno);
 	}
-	if (res < 0) {
-		if (res == EWOULDBLOCK || res == EINPROGRESS)
-			res = EAGAIN;
-		if (res != EAGAIN)
-			perf_log_warning("failed to send packet: %d (%s)",
-					 errno, strerror(errno));
-	} else if ((unsigned int) res != length)
-		perf_log_fatal("unexpected short write: %d", errno);
-	else {
-		if (tinfo->config->usetcp == ISC_TRUE) {
-			LOCK(&tinfo->lock);
-			s->num_sent++;
-			if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
-			    s->num_sent != 0 &&
-			    s->num_sent == tinfo->config->max_tcp_q) {
-				s->state = SOCKET_TCP_SENT_MAX;
-			}
-			if (s->state == SOCKET_SENDING)
-				s->state = SOCKET_FREE;
-			UNLOCK(&tinfo->lock);
+	
+	if (tinfo->config->usetcp == ISC_TRUE && error == 0) {
+		LOCK(&tinfo->lock);
+		s->num_sent++;
+		if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
+		    s->num_sent != 0 &&
+		    s->num_sent == tinfo->config->max_tcp_q) {
+			s->state = SOCKET_TCP_SENT_MAX;
 		}
+		if (s->state == SOCKET_SENDING) {
+			s->state = SOCKET_FREE;
+		}
+		UNLOCK(&tinfo->lock);
 	}
-	return res;
+	return error;
 }
 
 static isc_boolean_t
@@ -679,7 +681,6 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 {
 	int i, error;
 	for (i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
-		error = 0;
 		if (*socknum == tinfo->nsocks)
 			(*socknum) = 0;
 		sockinfo_t *sock = &tinfo->socks[*socknum];
@@ -689,8 +690,16 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			continue;
 		if (sock->state == SOCKET_SENDING) {
 			error = send_msg(tinfo, sock, &sock->sending);
-			if (error == EAGAIN)
-				continue;
+			if (error != 0) {
+				if (error == EAGAIN)
+					continue;
+				else {
+					/* TODO: Need to reset the connection again */
+					perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
+							 *socknum, sock->fd, strerror(error));
+					continue;
+				}
+			}
 		}
 		if (sock->state == SOCKET_TCP_HANDSHAKE) {
 			if (perf_os_waituntilwriteable(sock->fd, 0)
@@ -699,11 +708,6 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			LOCK(&tinfo->lock);
 			sock->state = (tinfo->config->usetcptls == ISC_TRUE) ? SOCKET_TLS_HANDSHAKE : SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
-		} else if (error != 0) {
-			/* TODO: Need to reset the connection again */
-			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
-			               *socknum, sock->fd, strerror(error));
-			continue;
 		}
 		if (sock->state == SOCKET_TLS_HANDSHAKE) {
 			LOCK(&tinfo->lock);
@@ -752,7 +756,7 @@ do_send(void *arg)
 	unsigned char packet_buffer[MAX_EDNS_PACKET];
 	unsigned char *base;
 	unsigned int length;
-	int n;
+	int error;
 	isc_result_t result;
 	int socknum;
 	
@@ -863,10 +867,10 @@ do_send(void *arg)
 				perf_log_fatal("out of memory");
 		}
 		q->timestamp = now;
-		n = send_msg(tinfo, q->sock, &msg);
+		error = send_msg(tinfo, q->sock, &msg);
 
-		if (n < 0) {
-			if (n == EAGAIN) {
+		if (error != 0) {
+			if (error == EAGAIN) {
 				LOCK(&tinfo->lock);
 				q->sock->state = SOCKET_SENDING;
 				isc_buffer_reinit(&q->sock->sending, base, length);
