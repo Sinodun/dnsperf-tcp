@@ -137,7 +137,7 @@ perf_net_parselocal(int family, const char *name, unsigned int port,
 
 int
 perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
-		    unsigned int offset, int bufsize, int sock_type)
+		    unsigned int offset, int bufsize, int sock_type, isc_boolean_t debug)
 {
 	int family;
 	int sock;
@@ -178,12 +178,16 @@ perf_net_opensocket(const isc_sockaddr_t *server, const isc_sockaddr_t *local,
 	port = isc_sockaddr_getport(&tmp);
 	if (offset == UINT_MAX) {
 		/* Override any port that has been set.*/
+		// if (debug == ISC_TRUE)
+		// 	perf_log_printf("Socket offset %d: overriding port %d with 0", offset, port);
 		isc_sockaddr_setport(&tmp, 0);
 	} else if (port != 0 && offset != 0) {
 		port += offset;
 		if (port >= 0xFFFF)
 			perf_log_fatal("port %d out of range", port);
 		isc_sockaddr_setport(&tmp, port);
+		if (debug == ISC_TRUE)
+			perf_log_printf("Socket offset %d: using port %d", offset, port);
 	}
 
 	if (bind(sock, &tmp.type.sa, tmp.length) == -1)

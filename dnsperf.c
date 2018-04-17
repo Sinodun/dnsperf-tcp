@@ -131,6 +131,7 @@ typedef struct {
 	isc_uint64_t stats_interval;
 	isc_boolean_t updates;
 	isc_boolean_t verbose;
+	isc_boolean_t debug;
 	isc_boolean_t usetcp;
 	isc_boolean_t usetcptls;
 	isc_uint32_t max_tcp_q;
@@ -272,8 +273,9 @@ print_initial_status(const config_t *config)
 
 	isc_netaddr_fromsockaddr(&addr, &config->server_addr);
 	isc_netaddr_format(&addr, buf, sizeof(buf));
-	printf("[Status] Sending %s (to %s)\n",
-	       config->updates ? "updates" : "queries", buf);
+	printf("[Status] Sending %s (to %s) over %s %s\n",
+	       config->updates ? "updates" : "queries", buf, config->usetcp ? "TCP" : "UDP",
+	       config->usetcptls ? "TLS" : "");
 
 	now = time(NULL);
 	printf("[Status] Started at: %s", ctime(&now));
@@ -525,10 +527,13 @@ setup(int argc, char **argv, config_t *config)
 	perf_opt_add('L', perf_opt_boolean, NULL,
 		     "use TCP/TLS",
 		     NULL, &config->usetcptls);
- 	perf_opt_add('Z', perf_opt_uint, "num_queries on tcp connection",
- 		     "max no. of queries to be sent on a single TCP connection",
- 		     stringify(0),
- 		     &config->max_tcp_q);	
+	perf_opt_add('g', perf_opt_boolean, NULL,
+		     "debug: report debug level info to stdout",
+		     NULL, &config->debug);
+	perf_opt_add('Z', perf_opt_uint, "num_queries on tcp connection",
+		     "max no. of queries to be sent on a single TCP connection",
+		     stringify(0),
+		     &config->max_tcp_q);	
 	perf_opt_parse(argc, argv);
 
         if (server_port == 0)
@@ -709,6 +714,17 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			sock->state = (tinfo->config->usetcptls == ISC_TRUE) ? SOCKET_TLS_HANDSHAKE : SOCKET_FREE;
 			UNLOCK(&tinfo->lock);
 		}
+		socklen_t len = (socklen_t)sizeof(error);
+		getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, 
+		           (void*)&error, &len);
+		if (error == EINPROGRESS || error == EWOULDBLOCK || error == EAGAIN) {
+			continue;
+		} else if (error != 0) {
+			/* TODO: Need to reset the connection again */
+			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
+			               *socknum, sock->fd, strerror(error));
+			continue;
+		}
 		if (sock->state == SOCKET_TLS_HANDSHAKE) {
 			LOCK(&tinfo->lock);
 			int res = SSL_connect(sock->ssl);
@@ -716,7 +732,8 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			UNLOCK(&tinfo->lock);
 			switch(res) {
 			case 0:
-				perf_log_fatal("SSL connect fail: %d", error);
+				/* TODO: Need to reset the connection again */
+				perf_log_fatal("SSL_connect failed (controlled fail): %d", error);
 				break;
 
 			case 1:
@@ -729,7 +746,7 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 				if (error == SSL_ERROR_WANT_READ ||
 				    error == SSL_ERROR_WANT_WRITE)
 					continue;
-				perf_log_fatal("SSL connect bad fail: %d", error);
+				perf_log_fatal("SSL_connect fail (fatal, not clean): %d", error);
 				break;
 			}
 		}
@@ -808,8 +825,13 @@ do_send(void *arg)
 		UNLOCK(&tinfo->lock);
 
 		socknum = tinfo->current_sock++ % tinfo->nsocks;
+		// if (tinfo->config->debug)
+		// 	perf_log_printf("[DEBUG] do_send: socknum = %d, tinfo->current_sock++ = %d",
+		// 	                socknum, tinfo->current_sock++);
 		if (tinfo->config->usetcp == ISC_TRUE && 
 		    !find_working_tcp_connection(&socknum, tinfo)) {
+			// if (tinfo->config->debug)
+			// 	perf_log_printf("[DEBUG] No working TCP connection");
 			now = get_time();
 			continue;
 		}
@@ -1103,32 +1125,37 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		return ISC_FALSE;
 	if (sock->state == SOCKET_TCP_SENT_MAX &&
 	    sock->num_recv >= tinfo->config->max_tcp_q) {
-		close(sock->fd);
 		LOCK(&tinfo->lock);
-		sock->fd = -1;
 		sock->num_sent = 0;
 		sock->num_recv = 0;
 		sock->state = SOCKET_CLOSED;
 		if (sock->ssl != NULL) {
+			SSL_shutdown(sock->ssl);
 			SSL_free(sock->ssl);
 			sock->ssl = NULL;
 		}
 		UNLOCK(&tinfo->lock);
+		close(sock->fd);
 		/* We can't easily re-open the same port because we have
 		the TIME_WAIT state, so for now disregard the -x option here*/
 		int fd = perf_net_opensocket(&tinfo->config->server_addr,
 					      &tinfo->config->local_addr,
 					      UINT_MAX,
-					      tinfo->config->bufsize, SOCK_STREAM);
-		if (fd == -1)
+					      tinfo->config->bufsize, SOCK_STREAM,
+					      tinfo->config->debug);
+		if (fd == -1) {
+			LOCK(&tinfo->lock);
+			sock->fd = -1;
+			UNLOCK(&tinfo->lock);
 			return ISC_FALSE;
+		}
 		stats->num_tcp_conns++;
 		LOCK(&tinfo->lock);
 		sock->fd = fd;
 		sock->state = SOCKET_TCP_HANDSHAKE;
 		sock->recv_state = SOCKET_TCP_HANDSHAKE;
-		UNLOCK(&tinfo->lock);
 		setup_ssl(tinfo, sock);
+		UNLOCK(&tinfo->lock);
 	}
 	return ISC_TRUE;
 }
@@ -1399,6 +1426,10 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 	if (tinfo->nsocks > MAX_SOCKETS)
 		tinfo->nsocks = MAX_SOCKETS;
 
+	if (tinfo->config->debug)
+		perf_log_printf("[DEBUG] Per-thread values: max_out = %d, max_qps = %d, max_nsocks = %d (Offset = %d)",
+		                 tinfo->max_outstanding, tinfo->max_qps, tinfo->nsocks, offset);
+
 	tinfo->socks = isc_mem_get(mctx, tinfo->nsocks * sizeof(sockinfo_t));
 	if (tinfo->socks == NULL)
 		perf_log_fatal("out of memory");
@@ -1409,6 +1440,7 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 		socket_offset += threads[i].nsocks;
 	for (i = 0; i < tinfo->nsocks; i++) {
 		tinfo->socks[i].state = SOCKET_FREE;
+		tinfo->socks[i].recv_state = SOCKET_FREE;
 		if (tinfo->config->usetcp == ISC_TRUE) {
 			sock_type = SOCK_STREAM;
 			tinfo->stats.num_tcp_conns++;
@@ -1416,16 +1448,21 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 			tinfo->socks[i].num_recv = 0;
 			isc_buffer_init(&tinfo->socks[i].sending, tinfo->socks[i].sending_buffer, MAX_EDNS_PACKET);
 			tinfo->socks[i].state = SOCKET_CLOSED;
+			tinfo->socks[i].recv_state = SOCKET_CLOSED;
 			tinfo->socks[i].ssl = NULL;
 		}
 		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
 							 &config->local_addr,
 							 socket_offset++,
-							 config->bufsize, sock_type);
+							 config->bufsize, sock_type, config->debug);
 		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i].fd != -1) {
 			tinfo->socks[i].state = SOCKET_TCP_HANDSHAKE;
+			tinfo->socks[i].recv_state = SOCKET_TCP_HANDSHAKE;
 			setup_ssl(tinfo, &tinfo->socks[i]);
 		}
+		if (tinfo->config->debug) 
+			perf_log_printf("[DEBUG] Initializing: Opened socket %d at socket offset %d with fd %d", 
+			                 i, socket_offset, tinfo->socks[i].fd);
 	}
 	tinfo->current_sock = 0;
 
