@@ -142,6 +142,8 @@ typedef struct {
 	isc_uint64_t end_time;
 	isc_uint64_t stop_time;
 	struct timespec stop_time_ns;
+	isc_uint64_t tcp_hs_time;
+	isc_uint64_t tls_hs_time;
 } times_t;
 
 typedef struct {
@@ -183,6 +185,11 @@ typedef struct
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
 	unsigned int tcp_to_read;
 	SSL *ssl;
+	isc_uint64_t con_start_time;
+	isc_uint64_t tcp_hs_done_time;
+	isc_uint64_t tls_hs_done_time;
+	isc_uint64_t cumulative_tcp_hs_time;
+	isc_uint64_t cumulative_tls_hs_time;
 } sockinfo_t;
 
 typedef ISC_LIST(struct query_info) query_list;
@@ -326,6 +333,7 @@ print_statistics(const config_t *config, const times_t *times, stats_t *stats)
 	isc_uint64_t run_time;
 	isc_boolean_t first_rcode;
 	isc_uint64_t latency_avg;
+	isc_uint64_t connection_time;
 	unsigned int i;
 
 	units = config->updates ? "Updates" : "Queries";
@@ -373,7 +381,7 @@ print_statistics(const config_t *config, const times_t *times, stats_t *stats)
 	printf("  Run time (s):         %u.%06u\n",
 	       (unsigned int)(run_time / MILLION),
 	       (unsigned int)(run_time % MILLION));
-	printf("  %s per second:   %.6lf\n", units,
+	printf("  %s per second:   %.6lf\n\n", units,
 	       SAFE_DIV(stats->num_completed, (((double)run_time) / MILLION)));
 	if (stats->num_tcp_conns != 0) {
 		printf("  TCP connections:      %u\n",
@@ -381,6 +389,21 @@ print_statistics(const config_t *config, const times_t *times, stats_t *stats)
 		printf("  Ave %s per conn: %i\n", units,
 		       (int)round(SAFE_DIV((double)stats->num_completed,
 		                (double)stats->num_tcp_conns)));
+		printf("  TCP HS time (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)(times->tcp_hs_time / MILLION),
+		          (unsigned int)(times->tcp_hs_time % MILLION),
+		          (100.0 * times->tcp_hs_time / run_time));
+		printf("  TLS HS time (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)(times->tls_hs_time / MILLION),
+		          (unsigned int)(times->tls_hs_time % MILLION),
+		          (100.0 * times->tls_hs_time / run_time));
+		printf("  Total HS time (s) :   %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)((times->tcp_hs_time+times->tls_hs_time) / MILLION),
+		          (unsigned int)((times->tcp_hs_time+times->tls_hs_time) % MILLION),
+		          (100.0 * (times->tcp_hs_time+times->tls_hs_time) / run_time));
+		connection_time = run_time - times->tcp_hs_time - times->tls_hs_time;
+		printf("  Adjusted %s/s:   %.6lf\n\n", units,
+		       SAFE_DIV(stats->num_completed, (((double)connection_time) / MILLION)));
 	}
 	printf("\n");
 
@@ -712,7 +735,12 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 				continue;
 			LOCK(&tinfo->lock);
 			sock->state = (tinfo->config->usetcptls == ISC_TRUE) ? SOCKET_TLS_HANDSHAKE : SOCKET_FREE;
+			sock->tcp_hs_done_time = get_time();
 			UNLOCK(&tinfo->lock);
+			if (tinfo->config->debug == ISC_TRUE) {
+				isc_uint64_t now = get_time();
+				perf_log_printf("[DEBUG] TCP HS done on sock         %d in thread %p at %" PRIu64 "(usec)", i, tinfo, now);
+			}
 		}
 		socklen_t len = (socklen_t)sizeof(error);
 		getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, 
@@ -739,7 +767,12 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 			case 1:
 				LOCK(&tinfo->lock);
 				sock->state = SOCKET_FREE;
+				sock->tls_hs_done_time = get_time();
 				UNLOCK(&tinfo->lock);
+				if (tinfo->config->debug == ISC_TRUE) {
+					isc_uint64_t now = get_time();
+					perf_log_printf("[DEBUG] TLS HS done on sock         %d in thread %p at %" PRIu64 "(usec)", i, tinfo, now);
+				}
 				break;
 
 			default:
@@ -1125,6 +1158,10 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 		return ISC_FALSE;
 	if (sock->state == SOCKET_TCP_SENT_MAX &&
 	    sock->num_recv >= tinfo->config->max_tcp_q) {
+		if (tinfo->config->debug == ISC_TRUE) {
+			isc_uint64_t now = get_time();
+			perf_log_printf("[DEBUG] Shutting down sock          %d in thread %p at %" PRIu64 "(usec)", socket, tinfo, now);
+		}
 		LOCK(&tinfo->lock);
 		sock->num_sent = 0;
 		sock->num_recv = 0;
@@ -1134,8 +1171,18 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 			SSL_free(sock->ssl);
 			sock->ssl = NULL;
 		}
+		sock->cumulative_tcp_hs_time += sock->tcp_hs_done_time - sock->con_start_time;
+		if (tinfo->config->usetcptls == ISC_TRUE)
+			sock->cumulative_tls_hs_time += sock->tls_hs_done_time - sock->tcp_hs_done_time;
+		sock->tcp_hs_done_time = 0;
+		sock->tls_hs_done_time = 0;
+		sock->con_start_time = get_time();
 		UNLOCK(&tinfo->lock);
 		close(sock->fd);
+		if (tinfo->config->debug == ISC_TRUE) {
+			isc_uint64_t now = get_time();
+			perf_log_printf("[DEBUG] Re-opening sock             %d in thread %p at %" PRIu64 "(usec)", socket, tinfo, now);
+		}
 		/* We can't easily re-open the same port because we have
 		the TIME_WAIT state, so for now disregard the -x option here*/
 		int fd = perf_net_opensocket(&tinfo->config->server_addr,
@@ -1450,6 +1497,11 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 			tinfo->socks[i].state = SOCKET_CLOSED;
 			tinfo->socks[i].recv_state = SOCKET_CLOSED;
 			tinfo->socks[i].ssl = NULL;
+			tinfo->socks[i].tcp_hs_done_time = 0;
+			tinfo->socks[i].tls_hs_done_time = 0;
+			tinfo->socks[i].cumulative_tcp_hs_time = 0;
+			tinfo->socks[i].cumulative_tls_hs_time = 0;
+			tinfo->socks[i].con_start_time = get_time();
 		}
 		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
 							 &config->local_addr,
@@ -1461,8 +1513,8 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 			setup_ssl(tinfo, &tinfo->socks[i]);
 		}
 		if (tinfo->config->debug) 
-			perf_log_printf("[DEBUG] Initializing: Opened socket %d at socket offset %d with fd %d", 
-			                 i, socket_offset, tinfo->socks[i].fd);
+			perf_log_printf("[DEBUG] Initializing: Opened socket %d in thread %p at %" PRIu64 "(usec) at socket offset %d with fd %d", 
+			                 i, tinfo, get_time(), socket_offset, tinfo->socks[i].fd);
 	}
 	tinfo->current_sock = 0;
 
@@ -1485,8 +1537,11 @@ threadinfo_cleanup(threadinfo_t *tinfo, times_t *times)
 
 	if (interrupted)
 		cancel_queries(tinfo);
-	for (i = 0; i < tinfo->nsocks; i++)
+	for (i = 0; i < tinfo->nsocks; i++) {
 		close(tinfo->socks[i].fd);
+		times->tcp_hs_time += tinfo->socks[i].cumulative_tcp_hs_time;
+		times->tls_hs_time += tinfo->socks[i].cumulative_tls_hs_time;
+	}
 	isc_mem_put(mctx, tinfo->socks, tinfo->nsocks * sizeof(sockinfo_t));
 	perf_dns_destroyctx(&tinfo->dnsctx);
 	if (tinfo->last_recv > times->end_time)
@@ -1537,6 +1592,8 @@ main(int argc, char **argv)
 		perf_log_fatal("out of memory");
 	/* TCP Handshakes start in threadinfo_init*/
 	times.start_time = get_time();
+	times.tcp_hs_time = 0;
+	times.tls_hs_time = 0;
 	for (i = 0; i < config.threads; i++)
 		threadinfo_init(&threads[i], &config, &times);
 	if (config.stats_interval > 0) {
