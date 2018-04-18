@@ -56,6 +56,7 @@
  ***/
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
