@@ -805,7 +805,6 @@ do_send(void *arg)
 	query_info *q;
 	int qid;
 	unsigned char packet_buffer[MAX_EDNS_PACKET];
-	unsigned char *base;
 	unsigned int length;
 	int error;
 	isc_result_t result;
@@ -913,7 +912,6 @@ do_send(void *arg)
 			msg.used += 2;
 		}
 
-		base = isc_buffer_base(&msg);
 		length = isc_buffer_usedlength(&msg);
 
 		now = get_time();
@@ -927,9 +925,12 @@ do_send(void *arg)
 
 		if (error != 0) {
 			if (error == EAGAIN) {
+				isc_region_t region;
 				LOCK(&tinfo->lock);
+				isc_buffer_usedregion(&msg, &region);
+				isc_buffer_clear(&q->sock->sending);
+				isc_buffer_copyregion(&q->sock->sending, &region);
 				q->sock->state = SOCKET_SENDING;
-				isc_buffer_reinit(&q->sock->sending, base, length);
 				UNLOCK(&tinfo->lock);
 			} else {
 				LOCK(&tinfo->lock);
