@@ -55,6 +55,7 @@
  ***	Version $Id: dnsperf.c 263303 2015-12-15 01:09:36Z bwelling $
  ***/
 
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
@@ -166,22 +167,30 @@ typedef struct {
 } stats_t;
 
 typedef enum {
-	SOCKET_FREE,
-	SOCKET_CLOSED,
-	SOCKET_TCP_HANDSHAKE,
-	SOCKET_TCP_SENT_MAX,
-	SOCKET_SENDING,
-	SOCKET_READING,
-	SOCKET_TLS_HANDSHAKE
-} socket_state_t;
+	SOCKET_SEND_CLOSED,
+	SOCKET_SEND_TCP_HANDSHAKE,
+	SOCKET_SEND_TLS_HANDSHAKE,
+	SOCKET_SEND_READY,
+	SOCKET_SEND_SENDING,
+	SOCKET_SEND_TCP_SENT_MAX,
+} socket_send_state_t;
+
+typedef enum {
+	SOCKET_RECV_CLOSED,
+	SOCKET_RECV_HANDSHAKE,
+	SOCKET_RECV_READY,
+	SOCKET_RECV_READING,
+} socket_recv_state_t;
 
 typedef struct 
 {
 	int fd;
+	unsigned int socket_number;
+	unsigned int port_offset;
 	isc_uint64_t num_recv;
 	isc_uint64_t num_sent;
-	socket_state_t state;
-	socket_state_t recv_state;
+	socket_send_state_t send_state;
+	socket_recv_state_t recv_state;
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
 	unsigned int tcp_to_read;
@@ -658,6 +667,9 @@ wait_for_start(void)
 
 static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 {
+	assert(s->send_state == SOCKET_SEND_SENDING ||
+	       s->send_state == SOCKET_SEND_READY);
+	
 	int error = 0, res, ssl_err;
 	unsigned int length = isc_buffer_usedlength(msg);
 	if (tinfo->config->usetcptls) {
@@ -689,16 +701,16 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 			perf_log_fatal("unexpected short write: %d", errno);
 	}
 	
-	if (tinfo->config->usetcp == ISC_TRUE && error == 0) {
+	if (tinfo->config->usetcp && error == 0) {
 		LOCK(&tinfo->lock);
 		s->num_sent++;
 		if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
 		    s->num_sent != 0 &&
 		    s->num_sent == tinfo->config->max_tcp_q) {
-			s->state = SOCKET_TCP_SENT_MAX;
+			s->send_state = SOCKET_SEND_TCP_SENT_MAX;
 		}
-		if (s->state == SOCKET_SENDING) {
-			s->state = SOCKET_FREE;
+		if (s->send_state == SOCKET_SEND_SENDING) {
+			s->send_state = SOCKET_SEND_READY;
 		}
 		UNLOCK(&tinfo->lock);
 	}
@@ -706,18 +718,18 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 }
 
 static isc_boolean_t
-find_working_tcp_connection(int *socknum, threadinfo_t *tinfo) 
+find_sending_tcp_connection(int *socknum, threadinfo_t *tinfo) 
 {
 	int i, error;
 	for (i = 0; i < tinfo->nsocks; i++, (*socknum)++) {
 		if (*socknum == tinfo->nsocks)
 			(*socknum) = 0;
 		sockinfo_t *sock = &tinfo->socks[*socknum];
-		if (sock->fd == -1 ||
-		    sock->state == SOCKET_CLOSED ||
-		    sock->state == SOCKET_TCP_SENT_MAX)
+		
+		if (sock->send_state == SOCKET_SEND_CLOSED ||
+		    sock->send_state == SOCKET_SEND_TCP_SENT_MAX)
 			continue;
-		if (sock->state == SOCKET_SENDING) {
+		if (sock->send_state == SOCKET_SEND_SENDING) {
 			error = send_msg(tinfo, sock, &sock->sending);
 			if (error != 0) {
 				if (error == EAGAIN)
@@ -728,33 +740,35 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 							 *socknum, sock->fd, strerror(error));
 					continue;
 				}
+			} else {
+				LOCK(&tinfo->lock);
+				sock->send_state = SOCKET_SEND_READY;
+				UNLOCK(&tinfo->lock);
 			}
 		}
-		if (sock->state == SOCKET_TCP_HANDSHAKE) {
+		if (sock->send_state == SOCKET_SEND_TCP_HANDSHAKE) {
 			if (perf_os_waituntilwriteable(sock->fd, 0)
 			                                  != ISC_R_SUCCESS)
 				continue;
 			LOCK(&tinfo->lock);
-			sock->state = (tinfo->config->usetcptls == ISC_TRUE) ? SOCKET_TLS_HANDSHAKE : SOCKET_FREE;
+			if (tinfo->config->usetcptls)
+				sock->send_state = SOCKET_SEND_TLS_HANDSHAKE;
+			else {
+				sock->send_state = SOCKET_SEND_READY;
+				sock->recv_state = SOCKET_RECV_READY;
+				if (tinfo->config->debug) {
+					isc_uint64_t now = get_time();
+					perf_log_printf("[DEBUG] Ready on sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
+				}
+			}
 			sock->tcp_hs_done_time = get_time();
 			UNLOCK(&tinfo->lock);
-			if (tinfo->config->debug == ISC_TRUE) {
+			if (tinfo->config->debug) {
 				isc_uint64_t now = get_time();
-				perf_log_printf("[DEBUG] TCP HS done on sock         %d in thread %p at %" PRIu64 "(usec)", i, tinfo, now);
+				perf_log_printf("[DEBUG] TCP HS done on sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
 			}
 		}
-		socklen_t len = (socklen_t)sizeof(error);
-		getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, 
-		           (void*)&error, &len);
-		if (error == EINPROGRESS || error == EWOULDBLOCK || error == EAGAIN) {
-			continue;
-		} else if (error != 0) {
-			/* TODO: Need to reset the connection again */
-			perf_log_warning("Error: cannot use connection %i, fd %d: %s", 
-			               *socknum, sock->fd, strerror(error));
-			continue;
-		}
-		if (sock->state == SOCKET_TLS_HANDSHAKE) {
+		if (sock->send_state == SOCKET_SEND_TLS_HANDSHAKE) {
 			LOCK(&tinfo->lock);
 			int res = SSL_connect(sock->ssl);
 			error = SSL_get_error(sock->ssl, res);
@@ -767,12 +781,13 @@ find_working_tcp_connection(int *socknum, threadinfo_t *tinfo)
 
 			case 1:
 				LOCK(&tinfo->lock);
-				sock->state = SOCKET_FREE;
+				sock->send_state = SOCKET_SEND_READY;
+				sock->recv_state = SOCKET_RECV_READY;
 				sock->tls_hs_done_time = get_time();
 				UNLOCK(&tinfo->lock);
-				if (tinfo->config->debug == ISC_TRUE) {
+				if (tinfo->config->debug) {
 					isc_uint64_t now = get_time();
-					perf_log_printf("[DEBUG] TLS HS done on sock         %d in thread %p at %" PRIu64 "(usec)", i, tinfo, now);
+					perf_log_printf("[DEBUG] TLS HS done on sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
 				}
 				break;
 
@@ -796,7 +811,6 @@ do_send(void *arg)
 	const config_t *config;
 	const times_t *times;
 	stats_t *stats;
-	unsigned int max_packet_size;
 	isc_buffer_t msg;
 	isc_uint64_t now, run_time, req_time;
 	char input_data[MAX_INPUT_DATA];
@@ -814,8 +828,7 @@ do_send(void *arg)
 	config = tinfo->config;
 	times = tinfo->times;
 	stats = &tinfo->stats;
-	max_packet_size = config->edns ? MAX_EDNS_PACKET : MAX_UDP_PACKET;
-	isc_buffer_init(&msg, packet_buffer, max_packet_size);
+	isc_buffer_init(&msg, packet_buffer, sizeof(packet_buffer));
 	isc_buffer_init(&lines, input_data, sizeof(input_data));
 
 	wait_for_start();
@@ -861,8 +874,8 @@ do_send(void *arg)
 		// if (tinfo->config->debug)
 		// 	perf_log_printf("[DEBUG] do_send: socknum = %d, tinfo->current_sock++ = %d",
 		// 	                socknum, tinfo->current_sock++);
-		if (tinfo->config->usetcp == ISC_TRUE && 
-		    !find_working_tcp_connection(&socknum, tinfo)) {
+		if (tinfo->config->usetcp && 
+		    !find_sending_tcp_connection(&socknum, tinfo)) {
 			// if (tinfo->config->debug)
 			// 	perf_log_printf("[DEBUG] No working TCP connection");
 			now = get_time();
@@ -902,7 +915,7 @@ do_send(void *arg)
 			continue;
 		}
 
-		if (tinfo->config->usetcp == ISC_TRUE){
+		if (tinfo->config->usetcp){
 			/* TODO: Better to use writev for TCP instead
 			   tcp needs two bytes for dns payload length */
 			memmove(msg.base + 2, msg.base, msg.used);
@@ -930,7 +943,7 @@ do_send(void *arg)
 				isc_buffer_usedregion(&msg, &region);
 				isc_buffer_clear(&q->sock->sending);
 				isc_buffer_copyregion(&q->sock->sending, &region);
-				q->sock->state = SOCKET_SENDING;
+				q->sock->send_state = SOCKET_SEND_SENDING;
 				UNLOCK(&tinfo->lock);
 			} else {
 				LOCK(&tinfo->lock);
@@ -1050,10 +1063,13 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 
 	s = &tinfo->socks[which_sock];
 
-	if (tinfo->config->usetcp != ISC_TRUE) {
+	assert(s->recv_state == SOCKET_RECV_READY ||
+	       s->recv_state == SOCKET_RECV_READING);
+
+	if (!tinfo->config->usetcp) {
 		bytes_read = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
-		if (s->recv_state != SOCKET_READING) {
+		if (s->recv_state != SOCKET_RECV_READING) {
 			pending = count_pending(tinfo, s);
 			if (pending < 0) {
 				*saved_errnop = errno;
@@ -1068,14 +1084,14 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 				}
 				LOCK(&tinfo->lock);
 				s->tcp_to_read = ((uint16_t)tcplength[0] << 8) | tcplength[1];
-				s->recv_state = SOCKET_READING;
+				s->recv_state = SOCKET_RECV_READING;
 				UNLOCK(&tinfo->lock);
 			} else {
 				*saved_errnop = EAGAIN;
 				return ISC_FALSE;
 			}
 		}
-		/* Now in SOCKET_READING */
+		/* Now in SOCKET_RECV_READING */
 		pending = count_pending(tinfo, s);
 		if (pending < 0) {
 			*saved_errnop = errno;
@@ -1089,7 +1105,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 				return ISC_FALSE;
 			}
 			LOCK(&tinfo->lock);
-			s->recv_state = SOCKET_FREE;
+			s->recv_state = SOCKET_RECV_READY;
 			UNLOCK(&tinfo->lock);
 		} else {
 			*saved_errnop = EAGAIN;
@@ -1138,73 +1154,105 @@ bit_check(unsigned char *bits, unsigned int bit)
 }
 
 static void
-setup_ssl(threadinfo_t *tinfo, sockinfo_t *s)
+close_socket(threadinfo_t *tinfo, sockinfo_t *sock)
 {
-	if (tinfo->config->usetcptls == ISC_TRUE) {
-		s->ssl = SSL_new(ctx);
-		if (s->ssl == NULL)
-			perf_log_fatal("creating SSL object: %s",
-				       ERR_reason_error_string(ERR_get_error()));
-		SSL_set_fd(s->ssl, s->fd);
+	if (tinfo->config->debug) {
+		isc_uint64_t now = get_time();
+		perf_log_printf("[DEBUG] Shutting down sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
 	}
+	LOCK(&tinfo->lock);
+	if (sock->ssl != NULL) {
+		SSL_shutdown(sock->ssl);
+		SSL_free(sock->ssl);
+		sock->ssl = NULL;
+	}
+	close(sock->fd);
+	sock->fd = -1;
+	sock->send_state = SOCKET_SEND_CLOSED;
+	sock->recv_state = SOCKET_RECV_CLOSED;
+
+	if (tinfo->config->usetcp) {
+		sock->cumulative_tcp_hs_time += sock->tcp_hs_done_time - sock->con_start_time;
+		if (tinfo->config->usetcptls)
+			sock->cumulative_tls_hs_time += sock->tls_hs_done_time - sock->tcp_hs_done_time;
+	}
+	UNLOCK(&tinfo->lock);
+}
+
+static isc_boolean_t
+open_socket(threadinfo_t *tinfo, sockinfo_t *sock, isc_boolean_t reopen)
+{
+	int sock_type = (tinfo->config->usetcp) ? SOCK_STREAM : SOCK_DGRAM;
+	/*
+	 * If re-opening, we can't easily re-open the same port because
+	 * it's probably in TIME_WAIT, so for now disregard the -x option.
+	 */
+	int fd = perf_net_opensocket(&tinfo->config->server_addr,
+				     &tinfo->config->local_addr,
+				     (reopen) ? UINT_MAX : sock->port_offset,
+				     tinfo->config->bufsize,
+				     sock_type,
+				     tinfo->config->debug);
+	
+	LOCK(&tinfo->lock);
+	sock->fd = fd;
+
+	if (tinfo->config->usetcp) {
+		tinfo->stats.num_tcp_conns++;
+		sock->num_sent = 0;
+		sock->num_recv = 0;
+		isc_buffer_init(&sock->sending, sock->sending_buffer, sizeof(sock->sending_buffer));
+		sock->tcp_hs_done_time = 0;
+		sock->tls_hs_done_time = 0;
+		sock->con_start_time = get_time();
+	}
+	
+	if (fd != -1 ) {
+		if (tinfo->config->usetcp) {
+			if (tinfo->config->usetcptls) {
+				sock->ssl = SSL_new(ctx);
+				if (sock->ssl == NULL)
+					perf_log_fatal("creating SSL object: %s",
+						       ERR_reason_error_string(ERR_get_error()));
+				SSL_set_fd(sock->ssl, fd);
+			}
+			sock->send_state = SOCKET_SEND_TCP_HANDSHAKE;
+			sock->recv_state = SOCKET_RECV_HANDSHAKE;
+		} else {
+			sock->send_state = SOCKET_SEND_READY;
+			sock->recv_state = SOCKET_RECV_READY;
+		}
+	} else {
+		sock->send_state = SOCKET_SEND_CLOSED;
+		sock->recv_state = SOCKET_RECV_CLOSED;
+	}
+	UNLOCK(&tinfo->lock);
+	
+	if (tinfo->config->debug) 
+		perf_log_printf("[DEBUG] %sInitializing: Opened socket %d in thread %p at %" PRIu64 "(usec) at socket offset %d with fd %d",
+				(reopen) ? "Re-" : "",
+				sock->socket_number,
+				tinfo,
+				get_time(),
+				sock->port_offset,
+				sock->fd);
+
+	return (fd != -1) ? ISC_TRUE : ISC_FALSE;
 }
 
 static isc_boolean_t
 check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 {
 	sockinfo_t *sock;
-	if (tinfo->done_sending)
-		return ISC_TRUE;
 	sock = &tinfo->socks[socket];
-	if (sock->fd ==  -1)
+	if (sock->recv_state == SOCKET_RECV_CLOSED ||
+	    sock->recv_state == SOCKET_RECV_HANDSHAKE)
 		return ISC_FALSE;
-	if (sock->state == SOCKET_TCP_SENT_MAX &&
+	if (sock->send_state == SOCKET_SEND_TCP_SENT_MAX &&
 	    sock->num_recv >= tinfo->config->max_tcp_q) {
-		if (tinfo->config->debug == ISC_TRUE) {
-			isc_uint64_t now = get_time();
-			perf_log_printf("[DEBUG] Shutting down sock          %d in thread %p at %" PRIu64 "(usec)", socket, tinfo, now);
-		}
-		LOCK(&tinfo->lock);
-		sock->num_sent = 0;
-		sock->num_recv = 0;
-		sock->state = SOCKET_CLOSED;
-		if (sock->ssl != NULL) {
-			SSL_shutdown(sock->ssl);
-			SSL_free(sock->ssl);
-			sock->ssl = NULL;
-		}
-		sock->cumulative_tcp_hs_time += sock->tcp_hs_done_time - sock->con_start_time;
-		if (tinfo->config->usetcptls == ISC_TRUE)
-			sock->cumulative_tls_hs_time += sock->tls_hs_done_time - sock->tcp_hs_done_time;
-		sock->tcp_hs_done_time = 0;
-		sock->tls_hs_done_time = 0;
-		sock->con_start_time = get_time();
-		UNLOCK(&tinfo->lock);
-		close(sock->fd);
-		if (tinfo->config->debug == ISC_TRUE) {
-			isc_uint64_t now = get_time();
-			perf_log_printf("[DEBUG] Re-opening sock             %d in thread %p at %" PRIu64 "(usec)", socket, tinfo, now);
-		}
-		/* We can't easily re-open the same port because we have
-		the TIME_WAIT state, so for now disregard the -x option here*/
-		int fd = perf_net_opensocket(&tinfo->config->server_addr,
-					      &tinfo->config->local_addr,
-					      UINT_MAX,
-					      tinfo->config->bufsize, SOCK_STREAM,
-					      tinfo->config->debug);
-		if (fd == -1) {
-			LOCK(&tinfo->lock);
-			sock->fd = -1;
-			UNLOCK(&tinfo->lock);
-			return ISC_FALSE;
-		}
-		stats->num_tcp_conns++;
-		LOCK(&tinfo->lock);
-		sock->fd = fd;
-		sock->state = SOCKET_TCP_HANDSHAKE;
-		sock->recv_state = SOCKET_TCP_HANDSHAKE;
-		setup_ssl(tinfo, sock);
-		UNLOCK(&tinfo->lock);
+		close_socket(tinfo, sock);
+		open_socket(tinfo, sock, ISC_TRUE);
+		return ISC_FALSE; /* Handshake needs to happen. */
 	}
 	return ISC_TRUE;
 }
@@ -1250,7 +1298,7 @@ do_recv(void *arg)
 			for (j = 0; j < tinfo->nsocks; j++) {
 				current_socket = (j + last_socket) %
 					tinfo->nsocks;
-				if (tinfo->config->usetcp == ISC_TRUE &&
+				if (tinfo->config->usetcp &&
 					!check_tcp_connection(tinfo, stats, current_socket))
 					continue;
 				if (bit_check(socketbits, current_socket))
@@ -1261,12 +1309,12 @@ do_recv(void *arg)
 					      &recvd[i], &saved_errno))
 				{
 					last_socket = (current_socket + 1);
-					if (tinfo->config->usetcp == ISC_TRUE)
+					if (tinfo->config->usetcp)
 						tinfo->socks[current_socket].num_recv++;
 					break;
 				}
 				bit_set(socketbits, current_socket);
-				if (!(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK))
+				if (saved_errno != EAGAIN)
 					break;
 			}
 			if (j == tinfo->nsocks)
@@ -1341,7 +1389,7 @@ do_recv(void *arg)
 		if (nrecvd < RECV_BATCH_SIZE) {
 			if (saved_errno == EINTR) {
 				continue;
-			} else if (saved_errno == EAGAIN) {
+			} else if (saved_errno == 0 || saved_errno == EAGAIN) {
 				int fds[MAX_SOCKETS];
 				for (int i = 0; i < tinfo->nsocks; ++i)
 					fds[i] = tinfo->socks[i].fd;
@@ -1353,8 +1401,8 @@ do_recv(void *arg)
 				now = get_time();
 				continue;
 			} else {
-				perf_log_fatal("failed to receive packet: %s",
-					       strerror(saved_errno));
+				perf_log_fatal("failed to receive packet: %d (%s)",
+					       saved_errno, strerror(saved_errno));
 			}
 		}
 	}
@@ -1436,7 +1484,7 @@ static void
 threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 		const times_t *times)
 {
-	unsigned int offset, socket_offset, i;
+	unsigned int offset, i;
 
 	memset(tinfo, 0, sizeof(*tinfo));
 	MUTEX_INIT(&tinfo->lock);
@@ -1483,40 +1531,17 @@ threadinfo_init(threadinfo_t *tinfo, const config_t *config,
 	if (tinfo->socks == NULL)
 		perf_log_fatal("out of memory");
 
-	socket_offset = 0;
-	int sock_type = SOCK_DGRAM;
+	int port_offset = 0;
 	for (i = 0; i < offset; i++)
-		socket_offset += threads[i].nsocks;
+		port_offset += threads[i].nsocks;
 	for (i = 0; i < tinfo->nsocks; i++) {
-		tinfo->socks[i].state = SOCKET_FREE;
-		tinfo->socks[i].recv_state = SOCKET_FREE;
-		if (tinfo->config->usetcp == ISC_TRUE) {
-			sock_type = SOCK_STREAM;
-			tinfo->stats.num_tcp_conns++;
-			tinfo->socks[i].num_sent = 0;
-			tinfo->socks[i].num_recv = 0;
-			isc_buffer_init(&tinfo->socks[i].sending, tinfo->socks[i].sending_buffer, MAX_EDNS_PACKET);
-			tinfo->socks[i].state = SOCKET_CLOSED;
-			tinfo->socks[i].recv_state = SOCKET_CLOSED;
-			tinfo->socks[i].ssl = NULL;
-			tinfo->socks[i].tcp_hs_done_time = 0;
-			tinfo->socks[i].tls_hs_done_time = 0;
-			tinfo->socks[i].cumulative_tcp_hs_time = 0;
-			tinfo->socks[i].cumulative_tls_hs_time = 0;
-			tinfo->socks[i].con_start_time = get_time();
-		}
-		tinfo->socks[i].fd = perf_net_opensocket(&config->server_addr,
-							 &config->local_addr,
-							 socket_offset++,
-							 config->bufsize, sock_type, config->debug);
-		if (tinfo->config->usetcp == ISC_TRUE && tinfo->socks[i].fd != -1) {
-			tinfo->socks[i].state = SOCKET_TCP_HANDSHAKE;
-			tinfo->socks[i].recv_state = SOCKET_TCP_HANDSHAKE;
-			setup_ssl(tinfo, &tinfo->socks[i]);
-		}
-		if (tinfo->config->debug) 
-			perf_log_printf("[DEBUG] Initializing: Opened socket %d in thread %p at %" PRIu64 "(usec) at socket offset %d with fd %d", 
-			                 i, tinfo, get_time(), socket_offset, tinfo->socks[i].fd);
+		sockinfo_t *sock = &tinfo->socks[i];
+		memset(sock, 0, sizeof(sockinfo_t));
+		
+		sock->socket_number = i;
+		sock->port_offset = port_offset++;
+
+		open_socket(tinfo, sock, ISC_FALSE);
 	}
 	tinfo->current_sock = 0;
 
