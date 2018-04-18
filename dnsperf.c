@@ -189,6 +189,7 @@ typedef struct
 	unsigned int port_offset;
 	isc_uint64_t num_recv;
 	isc_uint64_t num_sent;
+	isc_uint64_t num_in_flight;
 	socket_send_state_t send_state;
 	socket_recv_state_t recv_state;
 	isc_buffer_t sending;
@@ -704,8 +705,8 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 	if (tinfo->config->usetcp && error == 0) {
 		LOCK(&tinfo->lock);
 		s->num_sent++;
+		s->num_in_flight++;
 		if (tinfo->config->max_tcp_q != 0 &&  /* A limit is set */
-		    s->num_sent != 0 &&
 		    s->num_sent == tinfo->config->max_tcp_q) {
 			s->send_state = SOCKET_SEND_TCP_SENT_MAX;
 		}
@@ -980,6 +981,7 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 
 	do {
 		query_move(tinfo, q, append_unused);
+		q->sock->num_in_flight--;
 
 		tinfo->stats.num_timedout++;
 
@@ -1054,7 +1056,6 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 {
 	isc_uint16_t *packet_header;
 	sockinfo_t *s;
-	isc_uint64_t now;
 	uint8_t tcplength[2];
 	int bytes_read = 0;
 	int pending = 0;
@@ -1113,16 +1114,17 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 		}
 	}
 	
-	now = get_time();
 	if (bytes_read < 0) {
 		*saved_errnop = errno;
 		return ISC_FALSE;
 	}
+	s->num_recv++;
+	
 	recvd->sock = s;
 	recvd->qid = ntohs(packet_header[0]);
 	recvd->rcode = ntohs(packet_header[1]) & 0xF;
 	recvd->size = bytes_read;
-	recvd->when = now;
+	recvd->when = get_time();
 	recvd->sent = 0;
 	recvd->unexpected = ISC_FALSE;
 	recvd->short_response = ISC_TF(bytes_read < 4);
@@ -1196,6 +1198,7 @@ open_socket(threadinfo_t *tinfo, sockinfo_t *sock, isc_boolean_t reopen)
 	
 	LOCK(&tinfo->lock);
 	sock->fd = fd;
+	sock->num_in_flight = 0;
 
 	if (tinfo->config->usetcp) {
 		tinfo->stats.num_tcp_conns++;
@@ -1249,7 +1252,7 @@ check_tcp_connection(threadinfo_t *tinfo, stats_t *stats, unsigned int socket)
 	    sock->recv_state == SOCKET_RECV_HANDSHAKE)
 		return ISC_FALSE;
 	if (sock->send_state == SOCKET_SEND_TCP_SENT_MAX &&
-	    sock->num_recv >= tinfo->config->max_tcp_q) {
+	    sock->num_in_flight == 0) {
 		close_socket(tinfo, sock);
 		open_socket(tinfo, sock, ISC_TRUE);
 		return ISC_FALSE; /* Handshake needs to happen. */
@@ -1309,8 +1312,6 @@ do_recv(void *arg)
 					      &recvd[i], &saved_errno))
 				{
 					last_socket = (current_socket + 1);
-					if (tinfo->config->usetcp)
-						tinfo->socks[current_socket].num_recv++;
 					break;
 				}
 				bit_set(socketbits, current_socket);
@@ -1340,6 +1341,7 @@ do_recv(void *arg)
 			recvd[i].sent = q->timestamp;
 			recvd[i].desc = q->desc;
 			q->desc = NULL;
+			q->sock->num_in_flight--;
 		}
 		SIGNAL(&tinfo->cond);
 		UNLOCK(&tinfo->lock);
