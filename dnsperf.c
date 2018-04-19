@@ -400,19 +400,32 @@ print_statistics(const config_t *config, const times_t *times, stats_t *stats)
 		printf("  Ave %s per conn: %i\n", units,
 		       (int)round(SAFE_DIV((double)stats->num_completed,
 		                (double)stats->num_tcp_conns)));
-		printf("  TCP HS time (s) :     %u.%06u  (%.2lf%%)\n",
-		          (unsigned int)(times->tcp_hs_time / MILLION),
-		          (unsigned int)(times->tcp_hs_time % MILLION),
-		          (100.0 * times->tcp_hs_time / run_time));
-		printf("  TLS HS time (s) :     %u.%06u  (%.2lf%%)\n",
-		          (unsigned int)(times->tls_hs_time / MILLION),
-		          (unsigned int)(times->tls_hs_time % MILLION),
-		          (100.0 * times->tls_hs_time / run_time));
-		printf("  Total HS time (s) :   %u.%06u  (%.2lf%%)\n",
-		          (unsigned int)((times->tcp_hs_time+times->tls_hs_time) / MILLION),
-		          (unsigned int)((times->tcp_hs_time+times->tls_hs_time) % MILLION),
-		          (100.0 * (times->tcp_hs_time+times->tls_hs_time) / run_time));
-		connection_time = run_time - times->tcp_hs_time - times->tls_hs_time;
+		printf("  TCP HS time per client (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)((times->tcp_hs_time / config->clients) / MILLION),
+		          (unsigned int)((times->tcp_hs_time / config->clients) % MILLION),
+		          (100.0 * (times->tcp_hs_time / config->clients) / run_time));
+		printf("  TLS HS time per client (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)((times->tls_hs_time / config->clients) / MILLION),
+		          (unsigned int)((times->tls_hs_time / config->clients) % MILLION),
+		          (100.0 * (times->tls_hs_time / config->clients) / run_time));
+		printf("  Total HS time per client (s) :   %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)(((times->tcp_hs_time+times->tls_hs_time) / config->clients) / MILLION),
+		          (unsigned int)(((times->tcp_hs_time+times->tls_hs_time) / config->clients) % MILLION),
+		          (100.0 * ((times->tcp_hs_time+times->tls_hs_time) / config->clients) / run_time));
+		printf("  TCP HS time per connection (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)((times->tcp_hs_time / stats->num_tcp_conns) / MILLION),
+		          (unsigned int)((times->tcp_hs_time / stats->num_tcp_conns) % MILLION),
+		          (100.0 * (times->tcp_hs_time / stats->num_tcp_conns) / run_time));
+		printf("  TLS HS time per connection (s) :     %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)((times->tls_hs_time / stats->num_tcp_conns) / MILLION),
+		          (unsigned int)((times->tls_hs_time / stats->num_tcp_conns) % MILLION),
+		          (100.0 * (times->tls_hs_time / stats->num_tcp_conns) / run_time));
+		printf("  Total HS time per connection (s) :   %u.%06u  (%.2lf%%)\n",
+		          (unsigned int)(((times->tcp_hs_time+times->tls_hs_time) / stats->num_tcp_conns) / MILLION),
+		          (unsigned int)(((times->tcp_hs_time+times->tls_hs_time) / stats->num_tcp_conns) % MILLION),
+		          (100.0 * ((times->tcp_hs_time+times->tls_hs_time) / stats->num_tcp_conns) / run_time));
+
+		connection_time = run_time - ((times->tcp_hs_time + times->tls_hs_time) / config->clients);
 		printf("  Adjusted %s/s:   %.6lf\n\n", units,
 		       SAFE_DIV(stats->num_completed, (((double)connection_time) / MILLION)));
 	}
