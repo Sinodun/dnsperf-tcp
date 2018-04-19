@@ -1037,16 +1037,19 @@ int recv_buf(threadinfo_t *tinfo, sockinfo_t *s, unsigned char *buf, unsigned in
 		bytes_read = SSL_read(s->ssl, buf, buflen);
 		error = SSL_get_error(s->ssl, bytes_read);
 		UNLOCK(&tinfo->lock);
-		if (bytes_read <= 0)
-			return error;
+		if (bytes_read <= 0) {
+			if (error == SSL_ERROR_WANT_READ ||
+			    error == SSL_ERROR_WANT_WRITE)
+				errno = EAGAIN;
+			else
+				errno = error;
+			return -1;
+		}
 		else
 			return bytes_read;
 	} else {
 		bytes_read = recv(s->fd, buf, buflen, 0);
-		if (bytes_read == -1)
-			return errno;
-		else
-			return bytes_read;
+		return bytes_read;
 	}
 }
 
