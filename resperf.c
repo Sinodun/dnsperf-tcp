@@ -81,7 +81,7 @@
 #include "net.h"
 #include "opt.h"
 #include "util.h"
-#include "version.h"
+#include "config.h"
 
 /*
  * Global stuff
@@ -358,7 +358,7 @@ setup(int argc, char **argv)
 		perf_log_fatal("out of memory");
 	for (i = 0; i < nsocks; i++)
 		socks[i] = perf_net_opensocket(&server_addr, &local_addr, i,
-					       bufsize, SOCK_DGRAM);
+					       bufsize, SOCK_DGRAM, ISC_FALSE);
 
 }
 

@@ -184,7 +184,7 @@ name_fromstring(dns_name_t *name, dns_name_t *origin,
 	isc_buffer_t buffer;
 	isc_result_t result;
 
-	isc_buffer_init(&buffer, str, len);
+	isc_buffer_init(&buffer, (void *) str, len);
 	isc_buffer_add(&buffer, len);
 	result = dns_name_fromtext(name, &buffer, origin, 0, target);
 	if (result != ISC_R_SUCCESS)
