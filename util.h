@@ -28,6 +28,7 @@
 #define PERF_UTIL_H 1
 
 #define MILLION ((isc_uint64_t) 1000000)
+#define THOUSAND ((isc_uint64_t) 1000)
 
 #define THREAD(thread, start, arg) do {					\
 	int __n = pthread_create((thread), NULL, (start), (arg));	\
