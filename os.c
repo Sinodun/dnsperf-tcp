@@ -87,7 +87,7 @@ perf_os_waituntilwriteable(int fd, isc_int64_t timeout)
 	} else {
 		timeout_msec = timeout / THOUSAND;
 	}
-	n = poll((struct pollfd*)&write_fds, 1, timeout_msec);
+	n = poll(write_fds, 1, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
@@ -116,7 +116,7 @@ perf_os_waituntilreadable(int fd, int pipe_fd, isc_int64_t timeout)
 	} else {
 		timeout_msec = timeout / THOUSAND;
 	}
-	n = poll((struct pollfd*)&write_fds, 2, timeout_msec);
+	n = poll(write_fds, 2, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
@@ -150,7 +150,7 @@ perf_os_waituntilanyreadable(int *fds, unsigned int nfds, int pipe_fd,
 	} else {
 		timeout_msec = timeout / THOUSAND;
 	}
-	n = poll((struct pollfd*)&read_fds, nfds, timeout_msec);
+	n = poll(read_fds, nfds, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
