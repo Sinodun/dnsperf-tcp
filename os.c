@@ -37,7 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <sys/select.h>
+#include <poll.h>
 
 #include <isc/result.h>
 #include <isc/types.h>
@@ -76,25 +76,23 @@ perf_os_handlesignal(int sig, void (*handler)(int))
 isc_result_t
 perf_os_waituntilwriteable(int fd, isc_int64_t timeout)
 {
-	fd_set write_fds;
-	struct timeval tv, *tvp;
+	struct pollfd write_fds[1];
+	int timeout_msec;
 	int n;
 
-	FD_ZERO(&write_fds);
-	FD_SET(fd, &write_fds);
+	write_fds[0].fd = fd;
+	write_fds[0].events = POLLOUT;
 	if (timeout < 0) {
-		tvp = NULL;
+		timeout_msec = 0;
 	} else {
-		tv.tv_sec = timeout / MILLION;
-		tv.tv_usec = timeout % MILLION;
-		tvp = &tv;
+		timeout_msec = timeout / THOUSAND;
 	}
-	n = select(fd + 1, NULL, &write_fds, NULL, tvp);
+	n = poll(write_fds, 1, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
-	} else if (FD_ISSET(fd, &write_fds)) {
+	} else if (write_fds[0].revents & POLLOUT) {
 		return (ISC_R_SUCCESS);
 	} else {
 		return (ISC_R_TIMEDOUT);
@@ -104,30 +102,28 @@ perf_os_waituntilwriteable(int fd, isc_int64_t timeout)
 isc_result_t
 perf_os_waituntilreadable(int fd, int pipe_fd, isc_int64_t timeout)
 {
-	fd_set read_fds;
-	int maxfd;
-	struct timeval tv, *tvp;
+	struct pollfd write_fds[2];
+	int timeout_msec;
 	int n;
 
-	FD_ZERO(&read_fds);
-	FD_SET(fd, &read_fds);
-	FD_SET(pipe_fd, &read_fds);
-	maxfd = pipe_fd > fd ? pipe_fd : fd;
+	write_fds[0].fd = fd;
+	write_fds[1].fd = pipe_fd;
+	write_fds[0].events = POLLIN;
+	write_fds[1].events = POLLIN;
+
 	if (timeout < 0) {
-		tvp = NULL;
+		timeout_msec = 0;
 	} else {
-		tv.tv_sec = timeout / MILLION;
-		tv.tv_usec = timeout % MILLION;
-		tvp = &tv;
+		timeout_msec = timeout / THOUSAND;
 	}
-	n = select(maxfd + 1, &read_fds, NULL, NULL, tvp);
+	n = poll(write_fds, 2, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
-	} else if (FD_ISSET(fd, &read_fds)) {
+	} else if (write_fds[0].revents & POLLIN) {
 		return (ISC_R_SUCCESS);
-	} else if (FD_ISSET(pipe_fd, &read_fds)) {
+	} else if (write_fds[1].revents & POLLIN) {
 		return (ISC_R_CANCELED);
 	} else {
 		return (ISC_R_TIMEDOUT);
@@ -138,40 +134,30 @@ isc_result_t
 perf_os_waituntilanyreadable(int *fds, unsigned int nfds, int pipe_fd,
 			     isc_int64_t timeout)
 {
-	fd_set read_fds;
+	struct pollfd read_fds[nfds];
+	int timeout_msec;
 	unsigned int i;
-	int maxfd;
-	struct timeval tv, *tvp;
 	int n;
 
-	FD_ZERO(&read_fds);
-	maxfd = 0;
 	for (i = 0; i < nfds; i++) {
-		if (fds[i] == -1)
-			continue;
-		FD_SET(fds[i], &read_fds);
-		if (fds[i] > maxfd)
-			maxfd = fds[i];
+		read_fds[i].fd = fds[i];
+		read_fds[i].events = POLLIN;
 	}
-	FD_SET(pipe_fd, &read_fds);
-	if (pipe_fd > maxfd)
-		maxfd = pipe_fd;
+	read_fds[nfds].fd = pipe_fd;
 
 	if (timeout < 0) {
-		tvp = NULL;
+		timeout_msec = 0;
 	} else {
-		tv.tv_sec = timeout / MILLION;
-		tv.tv_usec = timeout % MILLION;
-		tvp = &tv;
+		timeout_msec = timeout / THOUSAND;
 	}
-	n = select(maxfd + 1, &read_fds, NULL, NULL, tvp);
+	n = poll(read_fds, nfds, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
 			perf_log_fatal("select() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
 	} else if (n == 0) {
 		return (ISC_R_TIMEDOUT);
-	} else if (FD_ISSET(pipe_fd, &read_fds)) {
+	} else if (read_fds[nfds].revents & POLLIN) {
 		return (ISC_R_CANCELED);
 	} else {
 		return (ISC_R_SUCCESS);

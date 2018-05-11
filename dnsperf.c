@@ -103,7 +103,7 @@
 
 #define MAX_INPUT_DATA			(64 * 1024)
 
-#define MAX_SOCKETS			256
+#define MAX_SOCKETS			2048
 
 #define RECV_BATCH_SIZE			16
 
