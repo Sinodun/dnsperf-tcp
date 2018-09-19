@@ -177,7 +177,7 @@ perf_dns_destroyctx(perf_dnsctx_t **ctxp)
 }
 
 static isc_result_t
-name_fromstring(dns_name_t *name, dns_name_t *origin,
+name_fromstring(dns_name_t *name, const dns_name_t *origin,
 		const char *str, unsigned int len,
 		isc_buffer_t *target, const char *type)
 {
