@@ -1,10 +1,14 @@
 This is dnsperf, a collection of DNS server performance testing tools.
 For more information, see the dnsperf(1) and resperf(1) man pages.
 
-NOTE 1: The build has been updated in this branch and so the build instructions 
+NOTE 1: The build has been updated in this branch and so the build instructions
 are different to those for the master branch.
 
 NOTE 2: The build requires autoconf-archive (package autoconf-archive on Debian)
+
+NOTE 3: On platforms such as MacOS which do not installed openssl in
+the default directories, you will need to use the '--with-openssl'
+option to configure, e.g. 'configure --with-openssl=/usr/local/opt/openssl'
 
 To configure, compile, and install these programs, follow these steps.
 
@@ -16,8 +20,10 @@ To configure, compile, and install these programs, follow these steps.
    header file, so if the compilation fails, obtain this file from the BIND
    source distribution, and install it in the appropriate place.
 
-2. Run "autoreconf -fi" and "./configure" to configure the software.  Most 
-   standard configure options are supported.
+2. Run "autoreconf -fi" and "./configure" to configure the software.  Most
+   standard configure options are supported. If you get an error
+   'possibly undefined macro: AC_MSG_ERROR' ensure that autoconf-archive
+   is installed.
 
 3. Run "make" to build dnsperf and resperf
 
