@@ -9,6 +9,10 @@ of this software, with the limitations imposed by this. So it is not really
 optimal for TCP connection handling - a better solution would be a standalone
 tool with all the functionality of dnsperf/resperf.
 
+_NOTE_ Support for TLS is available in a separate branch ```feature\tls_openssl```. To implement this 
+some re-factor of the code was required which has a small performance impact, therefore this code has not
+been merged into master. 
+
 Feedback and comments are welcome either via email to 
 sara@sinodun.com or jad@sinodun.com or via the issue tracker for this repo.
 
@@ -28,7 +32,6 @@ This work is supported by a donation from NLnet Foundation.
   number of TCP specific features to add in future e.g.
   * TCP Fast Open
   * Option to use TCP_NODELAY
-  * Support for TLS
 
 * The Statistics need to carefully interpreted when using TCP. The output called
   'Latency' has been re-named to 'RTT' since this is what it actually measures
