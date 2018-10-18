@@ -9,6 +9,11 @@ of this software, with the limitations imposed by this. So it is not really
 optimal for TCP connection handling - a better solution would be a standalone
 tool with all the functionality of dnsperf/resperf.
 
+*NOTE* This branch includes support for TLS. To implement this some re-factor
+of the code was required which has a small performance impact, therefore this
+code has not been merged into master. This branch also has some changes to the
+build system so please read the ```INSTALL``` file for details of how to build. 
+
 Feedback and comments are welcome either via email to 
 sara@sinodun.com or jad@sinodun.com or via the issue tracker for this repo.
 
@@ -28,7 +33,6 @@ This work is supported by a donation from NLnet Foundation.
   number of TCP specific features to add in future e.g.
   * TCP Fast Open
   * Option to use TCP_NODELAY
-  * Support for TLS
 
 * The Statistics need to carefully interpreted when using TCP. The output called
   'Latency' has been re-named to 'RTT' since this is what it actually measures
@@ -42,6 +46,8 @@ This work is supported by a donation from NLnet Foundation.
 # Usage
 
 * TCP is selected by specifying the '-z' flag. 
+
+* TLS is selected by specifying the `-L` flag.
 
 * This implementation was done with RFC7766 in mind so that by default dnsperf
   will open 1 TCP connection per client (as specified with the '-c' flag) and 
